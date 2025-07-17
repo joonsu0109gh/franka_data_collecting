@@ -308,12 +308,9 @@ class RealTimeRobotInterface:
                 # Set movement deltas for real-time control
                 self.set_movement_delta(delta_pos, delta_rot)
 
-        # Handle gripper
-        gripper_width = action.get('gripper_width', 0.0)
-        if gripper_width > 0.04:
-            self.open_gripper()
-        else:
-            self.close_gripper()
+        # Gripper control is now handled by button states only, not policy actions
+        # This prevents continuous gripper commands from the policy
+        # The gripper will only respond to button press events via set_gripper_button_state()
 
     def open_gripper(self):
         """Open the robot gripper."""
