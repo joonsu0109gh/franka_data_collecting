@@ -14,56 +14,59 @@ class RobotInterface:
         self._initialize_robot()
 
     def _initialize_robot(self):
-        """Initialize the robot connection. Override this method for different robot types."""
+        """Initialize the robot connection. Using panda_py library."""
         try:
-            # Try to use the existing FrankaAPI from robot.py
-            from robot import FrankaAPI
-            from franka.utils.inputs.spacemouse_shared_memory import Spacemouse
-            from multiprocessing.managers import SharedMemoryManager
+            # Use panda_py directly
+            import panda_py
+            import panda_py.controllers
+            from panda_py import libfranka
+            import numpy as np
 
-            # Create spacemouse for robot initialization
-            shm_manager = SharedMemoryManager()
-            shm_manager.start()
-            spacemouse = Spacemouse(shm_manager=shm_manager, deadzone=0.1)
+            self.panda = panda_py.Panda(hostname=self.robot_ip)
+            self.gripper = libfranka.Gripper(self.robot_ip)
+            self._robot_type = "panda_py"
+            print(
+                f"Using panda_py robot interface connected to {self.robot_ip}")
 
-            self.robot = FrankaAPI(robot_ip=self.robot_ip)
-            self.robot.startup(spacemouse)
-            self._robot_type = "FrankaAPI"
-            print("Using FrankaAPI robot interface")
+            # Move to home position
+            home_pose = np.array([
+                -0.01588696, -0.25534376, 0.18628714, -2.28398158,
+                0.0769999, 2.02505396, 0.07858208,
+            ])
+            self.panda.move_to_joint_position(home_pose)
+            self.gripper.move(width=0.09, speed=0.1)  # Open gripper
 
-        except ImportError:
-            try:
-                # Fallback to PandaRealRobot if available
-                from src.frankapy.src.realrobot import PandaRealRobot
-                self.robot = PandaRealRobot()
-                self._robot_type = "PandaRealRobot"
-                print("Using PandaRealRobot interface")
-            except ImportError:
-                raise ImportError(
-                    "No compatible robot interface found. Please ensure either robot.py or frankapy is available.")
+        except ImportError as e:
+            raise ImportError(
+                f"panda_py library not found. Please install it with: pip install panda_py\nError: {e}"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to connect to robot at {self.robot_ip}. Error: {e}")
 
     def get_obs(self) -> Dict[str, Any]:
         """Get current robot observation/state."""
-        if self._robot_type == "FrankaAPI":
-            status = self.robot.get_status()
-            if status is not None:
+        if self._robot_type == "panda_py":
+            try:
+                # Get robot state
+                robot_state = self.panda.get_state()
+                gripper_state = self.gripper.read_once()
+                ee_pos = self.panda.get_position()
+                ee_ori = self.panda.get_orientation()
+
                 return {
-                    'panda_joint_positions': status['q'],
-                    'panda_hand_pose': self._pose_from_position_orientation(
-                        status['EE_position'],
-                        status['EE_orientation']
-                    ),
-                    'panda_gripper_width': status['gripper_state']
+                    'panda_joint_positions': robot_state.q,
+                    'panda_hand_pose': self._pose_from_position_orientation(ee_pos, ee_ori),
+                    'panda_gripper_width': gripper_state.width
                 }
-            else:
-                # Return default values if no status available
+            except Exception as e:
+                print(f"Warning: Could not get robot state: {e}")
+                # Return default values if robot state unavailable
                 return {
                     'panda_joint_positions': np.zeros(7),
                     'panda_hand_pose': np.eye(4),
                     'panda_gripper_width': 0.0
                 }
-        elif self._robot_type == "PandaRealRobot":
-            return self.robot.get_obs()
         else:
             raise NotImplementedError(
                 f"get_obs not implemented for robot type: {self._robot_type}")
@@ -75,13 +78,21 @@ class RobotInterface:
 
     def set_ee_pose(self, target_pose, duration=0.1):
         """Set target end-effector pose."""
-        if self._robot_type == "FrankaAPI":
-            # For FrankaAPI, the pose control is handled internally via spacemouse
-            # This is a simplified implementation - you might need to modify robot.py
-            # to accept direct pose commands
-            pass
-        elif self._robot_type == "PandaRealRobot":
-            self.robot.set_ee_pose(target_pose, duration=duration)
+        if self._robot_type == "panda_py":
+            try:
+                # Extract position and orientation from 4x4 matrix
+                position = target_pose[:3, 3]
+                orientation_matrix = target_pose[:3, :3]
+
+                # Convert rotation matrix to quaternion
+                from scipy.spatial.transform import Rotation as R
+                rotation = R.from_matrix(orientation_matrix)
+                quaternion = rotation.as_quat()  # [x, y, z, w]
+
+                # Use move_to_pose instead of set_pose
+                self.panda.move_to_pose(position, quaternion)
+            except Exception as e:
+                print(f"Warning: Could not set EE pose: {e}")
         else:
             raise NotImplementedError(
                 f"set_ee_pose not implemented for robot type: {self._robot_type}")
@@ -102,38 +113,40 @@ class RobotInterface:
 
     def open_gripper(self):
         """Open the robot gripper."""
-        if self._robot_type == "FrankaAPI":
-            # FrankaAPI handles gripper through spacemouse buttons
-            pass
-        elif self._robot_type == "PandaRealRobot":
-            self.robot.open_gripper()
+        if self._robot_type == "panda_py":
+            try:
+                self.gripper.move(width=0.09, speed=0.1)
+            except Exception as e:
+                print(f"Warning: Could not open gripper: {e}")
 
     def close_gripper(self):
         """Close the robot gripper."""
-        if self._robot_type == "FrankaAPI":
-            # FrankaAPI handles gripper through spacemouse buttons
-            pass
-        elif self._robot_type == "PandaRealRobot":
-            self.robot.close_gripper()
+        if self._robot_type == "panda_py":
+            try:
+                self.gripper.grasp(width=0.01, speed=0.1, force=20)
+            except Exception as e:
+                print(f"Warning: Could not close gripper: {e}")
 
     def reset_joints(self):
         """Reset robot to a neutral joint configuration."""
-        if self._robot_type == "FrankaAPI":
-            # FrankaAPI initializes to home position in startup
-            pass
-        elif self._robot_type == "PandaRealRobot":
-            if hasattr(self.robot, 'reset_joints'):
-                self.robot.reset_joints()
-            else:
-                print("reset_joints not available for this robot type")
+        if self._robot_type == "panda_py":
+            try:
+                home_pose = np.array([
+                    -0.01588696, -0.25534376, 0.18628714, -2.28398158,
+                    0.0769999, 2.02505396, 0.07858208,
+                ])
+                self.panda.move_to_joint_position(home_pose)
+            except Exception as e:
+                print(f"Warning: Could not reset joints: {e}")
 
     def end(self):
         """Cleanup and end robot connection."""
-        if self.robot is not None:
-            if self._robot_type == "FrankaAPI":
-                self.robot.stop()
-            elif self._robot_type == "PandaRealRobot":
-                self.robot.end()
+        if self._robot_type == "panda_py":
+            try:
+                # No explicit cleanup needed for panda_py
+                print("Robot connection ended.")
+            except Exception as e:
+                print(f"Warning: Error during robot cleanup: {e}")
 
     def _pose_from_position_orientation(self, position, orientation):
         """Convert position and orientation to 4x4 pose matrix."""
