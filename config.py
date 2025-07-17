@@ -7,8 +7,8 @@ Modify these parameters to customize the behavior.
 ROBOT_IP = "172.16.0.2"  # IP address of the Franka robot
 
 # Control Parameters
-TRANSLATION_SCALE = 0.005  # Sensitivity for position control
-ROTATION_SCALE = 0.5       # Sensitivity for orientation control
+TRANSLATION_SCALE = 1.0    # Direct spacemouse values (like working example)
+ROTATION_SCALE = 1.0       # Direct spacemouse values (like working example)
 LOOP_RATE_HZ = 10          # Control loop frequency
 
 # Data Storage

@@ -6,8 +6,8 @@ from multiprocessing.managers import SharedMemoryManager
 from franka.utils.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from scipy.spatial.transform import Rotation as R
 
-# Constants for movement (from reference code)
-MOVE_INCREMENT = 0.006
+# Constants for movement (3x faster than working example)
+MOVE_INCREMENT = 0.003
 
 
 class RealTimeRobotInterface:
@@ -56,6 +56,8 @@ class RealTimeRobotInterface:
         self._gripper_stop_event = threading.Event()
         self._gripper_command = None
         self._gripper_lock = threading.Lock()
+        # Track previous button states for edge detection
+        self._last_button_state = [False, False]
 
         # Real-time control variables
         self.current_translation = None
@@ -140,32 +142,32 @@ class RealTimeRobotInterface:
             self._ready_event.set()
             print("🔄 Real-time control loop started at 1000Hz")
 
-            # Main real-time loop (matches reference: while ctx.ok() and not self._stop_event.is_set())
+            # Main real-time loop (matches working example: while ctx.ok() and not self._stop_event.is_set())
             while self.ctx.ok() and not self._stop_event.is_set():
-                # Get movement deltas from main thread (like reference gets from spnavstate)
+                # Get movement deltas from main thread (like working example gets from spacemouse)
                 with self._command_lock:
                     dpos = self._delta_translation * MOVE_INCREMENT
-                    drot = self._delta_rotation * MOVE_INCREMENT * 2  # Like reference code
-                    # Reset deltas after reading to prevent continuous application
-                    self._delta_translation = np.zeros(3, dtype=np.float32)
-                    self._delta_rotation = np.zeros(3, dtype=np.float32)
+                    drot = self._delta_rotation * MOVE_INCREMENT * 3  # Like working example
 
-                # Update translation (exactly like reference code)
-                self.current_translation += np.array(dpos, dtype=np.float32)
+                # Update translation (exactly like working example)
+                self.current_translation += np.array(
+                    [dpos[0], dpos[1], dpos[2]], dtype=np.float32)
 
-                # Update rotation (exactly like reference code)
+                # Update rotation (exactly like working example)
                 if np.any(drot != 0):
                     delta_rotation = R.from_euler("xyz", drot, degrees=False)
-                    curr_q = R.from_quat(self.current_rotation)
-                    new_q = (delta_rotation * curr_q).as_quat()
-                    self.current_rotation = new_q
+                    current_rotation_R = R.from_quat(self.current_rotation)
+                    self.current_rotation = (
+                        delta_rotation * current_rotation_R).as_quat()
 
-                # Send to controller (like reference code)
+                # Send to controller (like working example)
                 self.controller.set_control(
                     self.current_translation, self.current_rotation)
 
                 # Update state buffer
                 self._update_robot_state()
+
+                # (The panda context handles timing automatically)
 
             # Stop gripper thread
             self._gripper_stop_event.set()
@@ -178,23 +180,38 @@ class RealTimeRobotInterface:
             print("🔄 Real-time control loop stopped")
 
     def _gripper_control_loop(self):
-        """Gripper control loop - matches reference gripper thread pattern."""
+        """Gripper control loop - execute commands only once per button press."""
         while not self._gripper_stop_event.is_set():
             try:
+                command = None
                 with self._gripper_lock:
                     command = self._gripper_command
+                    # Clear command immediately to prevent re-execution
+                    if command:
+                        self._gripper_command = None
 
                 if command == "open":
-                    self.gripper.move(width=0.09, speed=0.1)
-                    self._gripper_command = None
+                    print("Opening gripper...")
+                    success = self.gripper.move(width=0.08, speed=0.05)
+                    if success:
+                        print("Release successful")
+                    else:
+                        print("Release failed")
                 elif command == "close":
-                    self.gripper.grasp(width=0.01, speed=0.1, force=20)
-                    self._gripper_command = None
+                    print("Closing gripper...")
+                    success = self.gripper.grasp(
+                        width=0.01, speed=0.05, force=20,
+                        epsilon_inner=0.005, epsilon_outer=0.005
+                    )
+                    if success:
+                        print("Grasp successful")
+                    else:
+                        print("Grasp failed")
 
             except Exception as e:
                 print(f"⚠️ Gripper control error: {e}")
 
-            time.sleep(0.001)  # Like reference code timing
+            time.sleep(0.01)  # 100Hz check rate
 
     def _update_robot_state(self):
         """Update the shared robot state buffer."""
@@ -223,13 +240,23 @@ class RealTimeRobotInterface:
             self._delta_rotation = np.array(rotation_delta, dtype=np.float32)
 
     def set_gripper_button_state(self, button_0_pressed, button_1_pressed):
-        """Handle gripper control via buttons like reference code."""
-        if button_0_pressed:  # Left button = grasp/close
+        """Handle gripper control via button PRESS events (not continuous states)."""
+        current_button_state = [button_0_pressed, button_1_pressed]
+
+        # Only trigger on button press (rising edge), not continuous press
+        # Left button just pressed
+        if button_0_pressed and not self._last_button_state[0]:
+            print("🔘 Left button pressed - closing gripper")
             with self._gripper_lock:
                 self._gripper_command = "close"
-        elif button_1_pressed:  # Right button = release/open
+        # Right button just pressed
+        elif button_1_pressed and not self._last_button_state[1]:
+            print("🔘 Right button pressed - opening gripper")
             with self._gripper_lock:
                 self._gripper_command = "open"
+
+        # Update last button state for next comparison
+        self._last_button_state = current_button_state
 
     def get_obs(self) -> Dict[str, Any]:
         """Get current robot observation/state from shared memory buffer."""

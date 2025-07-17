@@ -56,8 +56,8 @@ class DataCollectionController:
         print("="*60)
         print("Controls:")
         print("  • Move SpaceMouse: Control robot position")
-        print("  • Hold right button + move: Control robot orientation")
-        print("  • Left button: Toggle gripper open/close")
+        print("  • Left button: Close gripper")
+        print("  • Right button: Open gripper")
         print("  • Ctrl+C: Stop collection and save data")
         print("="*60 + "\n")
 
