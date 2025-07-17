@@ -1,40 +1,96 @@
 import numpy as np
+import threading
+import time
 from typing import Dict, Any
+from multiprocessing.managers import SharedMemoryManager
+from franka.utils.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
+from scipy.spatial.transform import Rotation as R
+
+# Constants for movement (from reference code)
+MOVE_INCREMENT = 0.006
 
 
-class RobotInterface:
+class RealTimeRobotInterface:
     """
-    A unified interface for robot control that can work with different robot implementations.
-    This adapter allows the data collection system to work with various robot backends.
+    Real-time robot interface using panda_py with proper control loop and shared memory.
+    Based on the reference implementation in robot.py but adapted for the modular system.
     """
 
     def __init__(self, robot_ip="172.16.0.2"):
         self.robot_ip = robot_ip
-        self.robot = None
+
+        # Shared memory for real-time communication
+        self.shm_manager = SharedMemoryManager()
+        self.shm_manager.start()
+
+        # Robot state template
+        robot_state = {
+            "q": np.zeros(7, dtype=np.float32),
+            "dq": np.zeros(7, dtype=np.float32),
+            "tau_J": np.zeros(7, dtype=np.float32),
+            "EE_position": np.zeros(3, dtype=np.float32),
+            "EE_orientation": np.zeros(4, dtype=np.float32),
+            "gripper_state": 0.0
+        }
+
+        self.robot_state_buffer = SharedMemoryRingBuffer.create_from_examples(
+            shm_manager=self.shm_manager,
+            examples=robot_state,
+            get_max_k=32,
+            get_time_budget=0.1,
+            put_desired_frequency=15
+        )
+
+        # Control threading
+        self._control_thread = None
+        self._stop_event = threading.Event()
+        self._ready_event = threading.Event()
+
+        # Movement deltas for real-time control (like reference code)
+        self._delta_translation = np.zeros(3, dtype=np.float32)
+        self._delta_rotation = np.zeros(3, dtype=np.float32)
+        self._command_lock = threading.Lock()
+
+        # Gripper control
+        self._gripper_thread = None
+        self._gripper_stop_event = threading.Event()
+        self._gripper_command = None
+        self._gripper_lock = threading.Lock()
+
+        # Real-time control variables
+        self.current_translation = None
+        self.current_rotation = None
+        self.controller = None
+        self.ctx = None
+
+        # Initialize robot connection
         self._initialize_robot()
 
     def _initialize_robot(self):
-        """Initialize the robot connection. Using panda_py library."""
+        """Initialize the robot connection."""
         try:
-            # Use panda_py directly
             import panda_py
             import panda_py.controllers
             from panda_py import libfranka
-            import numpy as np
 
             self.panda = panda_py.Panda(hostname=self.robot_ip)
             self.gripper = libfranka.Gripper(self.robot_ip)
-            self._robot_type = "panda_py"
-            print(
-                f"Using panda_py robot interface connected to {self.robot_ip}")
+            print(f"✅ Connected to robot at {self.robot_ip}")
 
-            # Move to home position
+            # Move to home position (initial setup) - matches reference robot.py
             home_pose = np.array([
-                -0.01588696, -0.25534376, 0.18628714, -2.28398158,
-                0.0769999, 2.02505396, 0.07858208,
-            ])
-            self.panda.move_to_joint_position(home_pose)
-            self.gripper.move(width=0.09, speed=0.1)  # Open gripper
+                [-0.01588696],
+                [-0.25534376],
+                [0.18628714],
+                [-2.28398158],
+                [0.0769999],
+                [2.02505396],
+                [0.07858208]
+            ], dtype=np.float64)
+
+            self.panda.move_to_joint_position(home_pose)  # type: ignore
+            self.gripper.move(width=0.09, speed=0.1)
+            print("✅ Robot moved to home position")
 
         except ImportError as e:
             raise ImportError(
@@ -44,109 +100,233 @@ class RobotInterface:
             raise RuntimeError(
                 f"Failed to connect to robot at {self.robot_ip}. Error: {e}")
 
-    def get_obs(self) -> Dict[str, Any]:
-        """Get current robot observation/state."""
-        if self._robot_type == "panda_py":
-            try:
-                # Get robot state
-                robot_state = self.panda.get_state()
-                gripper_state = self.gripper.read_once()
-                ee_pos = self.panda.get_position()
-                ee_ori = self.panda.get_orientation()
+    def start_realtime_control(self):
+        """Start the real-time control thread."""
+        if self._control_thread is None or not self._control_thread.is_alive():
+            self._stop_event.clear()
+            self._ready_event.clear()
+            self._control_thread = threading.Thread(
+                target=self._realtime_control_loop, daemon=True)
+            self._control_thread.start()
 
-                return {
-                    'panda_joint_positions': robot_state.q,
-                    'panda_hand_pose': self._pose_from_position_orientation(ee_pos, ee_ori),
-                    'panda_gripper_width': gripper_state.width
-                }
+            # Wait for control loop to be ready
+            if not self._ready_event.wait(timeout=10.0):
+                raise RuntimeError(
+                    "Real-time control loop failed to start within 10 seconds")
+            print("✅ Real-time control started")
+
+    def _realtime_control_loop(self):
+        """Real-time control loop running in separate thread - matches reference code pattern."""
+        try:
+            import panda_py.controllers
+
+            # Create high-frequency control context (1000Hz like reference)
+            self.ctx = self.panda.create_context(frequency=1000)
+            self.controller = panda_py.controllers.CartesianImpedance()
+            self.panda.start_controller(self.controller)
+            time.sleep(1)  # Let controller settle like reference code
+
+            # Get initial pose (like reference code)
+            self.current_translation = self.panda.get_position()
+            self.current_rotation = self.panda.get_orientation()
+
+            # Start gripper control thread
+            self._gripper_stop_event.clear()
+            self._gripper_thread = threading.Thread(
+                target=self._gripper_control_loop, daemon=True)
+            self._gripper_thread.start()
+
+            # Signal that we're ready
+            self._ready_event.set()
+            print("🔄 Real-time control loop started at 1000Hz")
+
+            # Main real-time loop (matches reference: while ctx.ok() and not self._stop_event.is_set())
+            while self.ctx.ok() and not self._stop_event.is_set():
+                # Get movement deltas from main thread (like reference gets from spnavstate)
+                with self._command_lock:
+                    dpos = self._delta_translation * MOVE_INCREMENT
+                    drot = self._delta_rotation * MOVE_INCREMENT * 2  # Like reference code
+                    # Reset deltas after reading to prevent continuous application
+                    self._delta_translation = np.zeros(3, dtype=np.float32)
+                    self._delta_rotation = np.zeros(3, dtype=np.float32)
+
+                # Update translation (exactly like reference code)
+                self.current_translation += np.array(dpos, dtype=np.float32)
+
+                # Update rotation (exactly like reference code)
+                if np.any(drot != 0):
+                    delta_rotation = R.from_euler("xyz", drot, degrees=False)
+                    curr_q = R.from_quat(self.current_rotation)
+                    new_q = (delta_rotation * curr_q).as_quat()
+                    self.current_rotation = new_q
+
+                # Send to controller (like reference code)
+                self.controller.set_control(
+                    self.current_translation, self.current_rotation)
+
+                # Update state buffer
+                self._update_robot_state()
+
+            # Stop gripper thread
+            self._gripper_stop_event.set()
+            if self._gripper_thread:
+                self._gripper_thread.join(timeout=1.0)
+
+        except Exception:
+            print("❌ Error in real-time control loop")
+        finally:
+            print("🔄 Real-time control loop stopped")
+
+    def _gripper_control_loop(self):
+        """Gripper control loop - matches reference gripper thread pattern."""
+        while not self._gripper_stop_event.is_set():
+            try:
+                with self._gripper_lock:
+                    command = self._gripper_command
+
+                if command == "open":
+                    self.gripper.move(width=0.09, speed=0.1)
+                    self._gripper_command = None
+                elif command == "close":
+                    self.gripper.grasp(width=0.01, speed=0.1, force=20)
+                    self._gripper_command = None
+
             except Exception as e:
-                print(f"Warning: Could not get robot state: {e}")
-                # Return default values if robot state unavailable
+                print(f"⚠️ Gripper control error: {e}")
+
+            time.sleep(0.001)  # Like reference code timing
+
+    def _update_robot_state(self):
+        """Update the shared robot state buffer."""
+        try:
+            robot_state = self.panda.get_state()
+            gripper_state = self.gripper.read_once()
+
+            state_data = {
+                "q": robot_state.q,
+                "dq": robot_state.dq,
+                "tau_J": robot_state.tau_J,
+                "EE_position": self.current_translation,
+                "EE_orientation": self.current_rotation,
+                "gripper_state": gripper_state.width
+            }
+
+            self.robot_state_buffer.put(state_data)
+        except Exception as e:
+            pass  # Don't spam errors in real-time loop
+
+    def set_movement_delta(self, translation_delta, rotation_delta):
+        """Set movement deltas for real-time control (replaces direct pose setting)."""
+        with self._command_lock:
+            self._delta_translation = np.array(
+                translation_delta, dtype=np.float32)
+            self._delta_rotation = np.array(rotation_delta, dtype=np.float32)
+
+    def set_gripper_button_state(self, button_0_pressed, button_1_pressed):
+        """Handle gripper control via buttons like reference code."""
+        if button_0_pressed:  # Left button = grasp/close
+            with self._gripper_lock:
+                self._gripper_command = "close"
+        elif button_1_pressed:  # Right button = release/open
+            with self._gripper_lock:
+                self._gripper_command = "open"
+
+    def get_obs(self) -> Dict[str, Any]:
+        """Get current robot observation/state from shared memory buffer."""
+        try:
+            state_data = self.robot_state_buffer.get()
+            if state_data is not None:
                 return {
-                    'panda_joint_positions': np.zeros(7),
-                    'panda_hand_pose': np.eye(4),
-                    'panda_gripper_width': 0.0
+                    'panda_joint_positions': state_data['q'],
+                    'panda_hand_pose': self._pose_from_position_orientation(
+                        state_data['EE_position'],
+                        state_data['EE_orientation']
+                    ),
+                    'panda_gripper_width': state_data['gripper_state']
                 }
-        else:
-            raise NotImplementedError(
-                f"get_obs not implemented for robot type: {self._robot_type}")
+        except Exception:
+            pass
+
+        # Fallback if no data available
+        return {
+            'panda_joint_positions': np.zeros(7),
+            'panda_hand_pose': np.eye(4),
+            'panda_gripper_width': 0.0
+        }
 
     def get_ee_pose(self):
         """Get current end-effector pose as 4x4 matrix."""
         obs = self.get_obs()
         return obs['panda_hand_pose']
 
-    def set_ee_pose(self, target_pose, duration=0.1):
-        """Set target end-effector pose."""
-        if self._robot_type == "panda_py":
-            try:
-                # Extract position and orientation from 4x4 matrix
-                position = target_pose[:3, 3]
-                orientation_matrix = target_pose[:3, :3]
-
-                # Convert rotation matrix to quaternion
-                from scipy.spatial.transform import Rotation as R
-                rotation = R.from_matrix(orientation_matrix)
-                quaternion = rotation.as_quat()  # [x, y, z, w]
-
-                # Use move_to_pose instead of set_pose
-                self.panda.move_to_pose(position, quaternion)
-            except Exception as e:
-                print(f"Warning: Could not set EE pose: {e}")
-        else:
-            raise NotImplementedError(
-                f"set_ee_pose not implemented for robot type: {self._robot_type}")
-
     def step(self, action: Dict[str, Any]):
-        """Execute a single action step."""
-        target_pose = action.get('ee_pose')
-        gripper_width = action.get('gripper_width', 0.0)
+        """Execute a single action step by setting movement deltas."""
+        # Use direct deltas if provided (preferred for real-time control)
+        if 'delta_translation' in action and 'delta_rotation' in action:
+            delta_translation = action['delta_translation']
+            delta_rotation = action['delta_rotation']
+            self.set_movement_delta(delta_translation, delta_rotation)
+        else:
+            # Fallback: calculate deltas from pose difference
+            target_pose = action.get('ee_pose')
+            if target_pose is not None:
+                current_pose = self.get_ee_pose()
+                delta_pos = target_pose[:3, 3] - current_pose[:3, 3]
 
-        if target_pose is not None:
-            self.set_ee_pose(target_pose)
+                # Calculate rotation delta
+                current_rot = R.from_matrix(current_pose[:3, :3])
+                target_rot = R.from_matrix(target_pose[:3, :3])
+                delta_rot = (target_rot * current_rot.inv()).as_euler("xyz")
+
+                # Set movement deltas for real-time control
+                self.set_movement_delta(delta_pos, delta_rot)
 
         # Handle gripper
-        if gripper_width > 0.04:  # Open threshold
+        gripper_width = action.get('gripper_width', 0.0)
+        if gripper_width > 0.04:
             self.open_gripper()
         else:
             self.close_gripper()
 
     def open_gripper(self):
         """Open the robot gripper."""
-        if self._robot_type == "panda_py":
-            try:
-                self.gripper.move(width=0.09, speed=0.1)
-            except Exception as e:
-                print(f"Warning: Could not open gripper: {e}")
+        with self._gripper_lock:
+            self._gripper_command = "open"
 
     def close_gripper(self):
         """Close the robot gripper."""
-        if self._robot_type == "panda_py":
-            try:
-                self.gripper.grasp(width=0.01, speed=0.1, force=20)
-            except Exception as e:
-                print(f"Warning: Could not close gripper: {e}")
+        with self._gripper_lock:
+            self._gripper_command = "close"
 
     def reset_joints(self):
-        """Reset robot to a neutral joint configuration."""
-        if self._robot_type == "panda_py":
-            try:
-                home_pose = np.array([
-                    -0.01588696, -0.25534376, 0.18628714, -2.28398158,
-                    0.0769999, 2.02505396, 0.07858208,
-                ])
-                self.panda.move_to_joint_position(home_pose)
-            except Exception as e:
-                print(f"Warning: Could not reset joints: {e}")
+        """Reset robot to home position."""
+        try:
+            home_pose = np.array([
+                [-0.01588696],
+                [-0.25534376],
+                [0.18628714],
+                [-2.28398158],
+                [0.0769999],
+                [2.02505396],
+                [0.07858208]
+            ], dtype=np.float64)
+            self.panda.move_to_joint_position(home_pose)  # type: ignore
+        except Exception as e:
+            print(f"⚠️ Could not reset joints: {e}")
+
+    def stop(self):
+        """Stop the real-time control loop."""
+        self._stop_event.set()
+        if self._control_thread and self._control_thread.is_alive():
+            self._control_thread.join(timeout=2.0)
+        print("✅ Real-time control stopped")
 
     def end(self):
         """Cleanup and end robot connection."""
-        if self._robot_type == "panda_py":
-            try:
-                # No explicit cleanup needed for panda_py
-                print("Robot connection ended.")
-            except Exception as e:
-                print(f"Warning: Error during robot cleanup: {e}")
+        self.stop()
+        if self.shm_manager:
+            self.shm_manager.shutdown()
+        print("✅ Robot interface cleaned up")
 
     def _pose_from_position_orientation(self, position, orientation):
         """Convert position and orientation to 4x4 pose matrix."""
@@ -154,9 +334,12 @@ class RobotInterface:
         pose[:3, 3] = position
 
         # Convert quaternion to rotation matrix
-        from scipy.spatial.transform import Rotation as R
         if len(orientation) == 4:  # quaternion
             rotation = R.from_quat(orientation)
             pose[:3, :3] = rotation.as_matrix()
 
         return pose
+
+
+# Backward compatibility alias
+RobotInterface = RealTimeRobotInterface

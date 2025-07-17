@@ -47,6 +47,10 @@ class DataCollectionController:
         self.robot.reset_joints()
         self.robot.open_gripper()
 
+        # Start real-time control loop
+        print("Starting real-time control loop...")
+        self.robot.start_realtime_control()
+
         print("\n" + "="*60)
         print("🤖 ROBOT DATA COLLECTION READY")
         print("="*60)
@@ -75,8 +79,12 @@ class DataCollectionController:
                 # 3. Get the desired action from the policy
                 action = self.policy.get_action(mouse_state, current_ee_pose)
 
-                # 4. Execute the action on the robot
+                # 4. Execute the action on the robot (real-time)
                 self.robot.step(action)
+
+                # Also send direct button states for gripper control (like reference)
+                self.robot.set_gripper_button_state(
+                    mouse_state.buttons[0], mouse_state.buttons[1])
 
                 # 5. Record the observation and the action
                 # We get a fresh observation after the step to record the *result* of the action
