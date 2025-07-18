@@ -72,7 +72,6 @@ def spacemouse_process(shm_name: str, stop_event):
                 existing_shm.close()
         except Exception:
             pass
-        print("SpaceMouse process stopped.")
 
 
 class SpaceMouseManager:
@@ -106,7 +105,6 @@ class SpaceMouseManager:
                 daemon=True
             )
             self.process.start()
-            print("SpaceMouse shared memory process started.")
 
     def get_state(self):
         """

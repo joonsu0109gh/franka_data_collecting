@@ -113,17 +113,6 @@ class DataCollectionController:
             # Copy to avoid race conditions (this is very fast)
             img_primary = self.latest_frame_primary.copy()
             img_wrist = self.latest_frame_wrist.copy()
-
-            # Debug: Check if images have actual data
-            primary_sum = np.sum(img_primary)
-            wrist_sum = np.sum(img_wrist)
-
-            if primary_sum == 0 and wrist_sum == 0:
-                print("⚠️ Camera images are all zeros - no data from camera process")
-            else:
-                print(
-                    f"📸 Camera data: Primary sum={primary_sum}, Wrist sum={wrist_sum}")
-
             return img_primary, img_wrist
         except Exception as e:
             print(f"❌ Error getting camera images: {e}")
@@ -243,8 +232,8 @@ class DataCollectionController:
                 step_count += 1  # Always increment step count
 
                 # Monitor control loop performance less frequently to reduce overhead
-                # Check every 100 steps (~10 seconds at 10Hz)
-                if step_count % 100 == 0 and step_count > 0:
+                # Check every 200 steps (~20 seconds at 10Hz) to reduce console spam
+                if step_count % 200 == 0 and step_count > 0:
                     actual_hz = self.rate_limiter.get_actual_rate()
                     recorded_timesteps = step_count // 50  # Actual recorded data points
 
@@ -258,7 +247,7 @@ class DataCollectionController:
                                 f"⚠️ Rate too low: {actual_hz:.2f}Hz < 9.7Hz")
 
                     print(
-                        f"📊 Episode {episode_num}: {recorded_timesteps} recorded timesteps ({step_count} control steps) | Control loop: {actual_hz:.2f}Hz (target: {self.loop_rate_hz}Hz)")
+                        f"📊 Episode {episode_num}: {recorded_timesteps} recorded timesteps ({step_count} control steps) | Control loop: {actual_hz:.2f}Hz")
 
                 # Maintain precise 10Hz control loop using Rate class
                 self.rate_limiter.sleep()

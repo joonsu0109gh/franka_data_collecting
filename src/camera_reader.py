@@ -21,8 +21,7 @@ def camera_process_realsense(shm_name_primary, shm_name_wrist, shape, dtype, sto
         print("❌ RealSense not available, cannot run camera process")
         return
 
-    print(
-        f"📸 Camera process starting for serials: {primary_serial}, {wrist_serial}")
+    print("📸 Camera process starting...")
 
     # Initialize variables
     shm_primary = None
@@ -37,7 +36,6 @@ def camera_process_realsense(shm_name_primary, shm_name_wrist, shape, dtype, sto
             devices = ctx.query_devices()
             available_serials = [dev.get_info(
                 rs.camera_info.serial_number) for dev in devices]
-            print(f"📸 Found cameras: {available_serials}")
 
             if len(available_serials) >= 2:
                 primary_serial = primary_serial or available_serials[0]
@@ -87,10 +85,7 @@ def camera_process_realsense(shm_name_primary, shm_name_wrist, shape, dtype, sto
                 rs.stream.color, 640, 480, rs.format.bgr8, 30)
 
             # Try to start pipelines - this is where "device busy" errors occur
-            print(f"📸 Starting pipeline for camera {primary_serial}...")
             pipeline_primary.start(config_primary)
-
-            print(f"📸 Starting pipeline for camera {wrist_serial}...")
             pipeline_wrist.start(config_wrist)
 
             print("✅ Both camera pipelines started successfully!")
@@ -120,10 +115,10 @@ def camera_process_realsense(shm_name_primary, shm_name_wrist, shape, dtype, sto
 
                         frame_count += 1
 
-                        # Print FPS occasionally
-                        if frame_count % 30 == 0:
+                        # Print FPS occasionally (less frequently to reduce spam)
+                        if frame_count % 300 == 0:  # Every 10 seconds at 30 FPS
                             current_time = time.time()
-                            fps = 30 / (current_time - last_fps_time)
+                            fps = 300 / (current_time - last_fps_time)
                             print(f"📸 Camera FPS: {fps:.1f}")
                             last_fps_time = current_time
 
@@ -199,7 +194,6 @@ def camera_process_realsense(shm_name_primary, shm_name_wrist, shape, dtype, sto
             break
 
     # Cleanup
-    print("🛑 Camera process cleanup...")
     try:
         if pipeline_primary:
             pipeline_primary.stop()
@@ -209,7 +203,6 @@ def camera_process_realsense(shm_name_primary, shm_name_wrist, shape, dtype, sto
             shm_primary.close()
         if shm_wrist:
             shm_wrist.close()
-        print("✅ Camera cleanup complete")
     except Exception as e:
         print(f"⚠️ Cleanup error: {e}")
 
