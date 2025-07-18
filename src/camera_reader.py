@@ -17,6 +17,25 @@ def camera_process_realsense(shm_name_primary, shm_name_wrist, shape, dtype, sto
     Continuously captures frames from RealSense cameras and writes them to shared memory.
     This runs in a separate process and doesn't block the main control loop.
     """
+    if not REALSENSE_AVAILABLE:
+        print("❌ RealSense not available, cannot run camera process")
+        return
+
+    # 👇 --- ADD HARDWARE RESET LOGIC ---
+    try:
+        ctx = rs.context()
+        devices = ctx.query_devices()
+        for dev in devices:
+            dev_serial = dev.get_info(rs.camera_info.serial_number)
+            if dev_serial == primary_serial or dev_serial == wrist_serial:
+                print(
+                    f"Found device {dev_serial}, requesting hardware reset...")
+                dev.hardware_reset()
+                time.sleep(5)  # Give the camera time to reset and reconnect
+    except Exception as e:
+        print(f"⚠️ Could not reset hardware: {e}")
+    # --- END OF RESET LOGIC ---
+
     try:
         # Attach to the existing shared memory blocks
         shm_primary = shared_memory.SharedMemory(name=shm_name_primary)
