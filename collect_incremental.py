@@ -53,59 +53,14 @@ class DataCollectionController:
         if not camera_success:
             print("⚠️ Cameras failed to initialize, continuing without cameras")
 
-    def _reset_cameras_if_needed(self, primary_serial=None, wrist_serial=None):
-        """Reset RealSense cameras before starting to avoid 'device busy' errors."""
-        try:
-            import pyrealsense2 as rs
-            print("🔄 Checking for cameras to reset...")
-
-            ctx = rs.context()
-            devices = ctx.query_devices()
-
-            reset_count = 0
-            for dev in devices:
-                dev_serial = dev.get_info(rs.camera_info.serial_number)
-
-                # If no specific serials provided, reset all cameras
-                # If specific serials provided, only reset matching ones
-                should_reset = False
-                if primary_serial is None and wrist_serial is None:
-                    should_reset = True  # Reset all cameras
-                elif dev_serial == primary_serial or dev_serial == wrist_serial:
-                    should_reset = True  # Reset matching cameras
-
-                if should_reset:
-                    print(
-                        f"📸 Found camera {dev_serial}, requesting hardware reset...")
-                    dev.hardware_reset()
-                    reset_count += 1
-
-            if reset_count > 0:
-                print(
-                    f"⏳ Waiting 5 seconds for {reset_count} camera(s) to reset and reconnect...")
-                time.sleep(5)
-            else:
-                print("ℹ️ No cameras found to reset")
-
-        except ImportError:
-            print("⚠️ pyrealsense2 not available, skipping camera reset")
-        except Exception as e:
-            print(f"⚠️ Could not reset cameras: {e}")
-
     def _initialize_shared_memory_cameras(self, primary_serial=None, wrist_serial=None):
         """Initialize shared memory cameras for fast, non-blocking access."""
         try:
-            # 👇 --- RESET CAMERAS BEFORE STARTING PROCESS ---
-            self._reset_cameras_if_needed(primary_serial, wrist_serial)
-            # --- END OF RESET LOGIC ---
-
             # Define camera properties
             self.cam_shape = (480, 640, 3)  # Height, Width, Channels
             self.cam_dtype = np.uint8
             frame_size = int(np.prod(self.cam_shape) *
-                             np.dtype(self.cam_dtype).itemsize)
-
-            # Create shared memory blocks for both cameras
+                             np.dtype(self.cam_dtype).itemsize)            # Create shared memory blocks for both cameras
             self.shm_primary = shared_memory.SharedMemory(
                 create=True, size=frame_size)
             self.shm_wrist = shared_memory.SharedMemory(

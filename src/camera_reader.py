@@ -14,110 +14,204 @@ except ImportError:
 def camera_process_realsense(shm_name_primary, shm_name_wrist, shape, dtype, stop_event,
                              primary_serial=None, wrist_serial=None):
     """
-    Continuously captures frames from RealSense cameras and writes them to shared memory.
-    This runs in a separate process and doesn't block the main control loop.
+    Self-contained camera process with robust error handling and automatic reset.
+    This process handles its own hardware reset to avoid race conditions.
     """
     if not REALSENSE_AVAILABLE:
         print("❌ RealSense not available, cannot run camera process")
         return
 
-    # 👇 --- ADD HARDWARE RESET LOGIC ---
-    try:
-        ctx = rs.context()
-        devices = ctx.query_devices()
-        for dev in devices:
-            dev_serial = dev.get_info(rs.camera_info.serial_number)
-            if dev_serial == primary_serial or dev_serial == wrist_serial:
+    print(
+        f"📸 Camera process starting for serials: {primary_serial}, {wrist_serial}")
+
+    # Initialize variables
+    shm_primary = None
+    shm_wrist = None
+    pipeline_primary = None
+    pipeline_wrist = None
+
+    # Get default serial numbers if not provided
+    if primary_serial is None or wrist_serial is None:
+        try:
+            ctx = rs.context()
+            devices = ctx.query_devices()
+            available_serials = [dev.get_info(
+                rs.camera_info.serial_number) for dev in devices]
+            print(f"📸 Found cameras: {available_serials}")
+
+            if len(available_serials) >= 2:
+                primary_serial = primary_serial or available_serials[0]
+                wrist_serial = wrist_serial or available_serials[1]
                 print(
-                    f"Found device {dev_serial}, requesting hardware reset...")
-                dev.hardware_reset()
-                time.sleep(5)  # Give the camera time to reset and reconnect
-    except Exception as e:
-        print(f"⚠️ Could not reset hardware: {e}")
-    # --- END OF RESET LOGIC ---
+                    f"📸 Using cameras: Primary={primary_serial}, Wrist={wrist_serial}")
+            else:
+                print(
+                    f"❌ Need at least 2 cameras, found {len(available_serials)}")
+                return
+        except Exception as e:
+            print(f"❌ Failed to enumerate cameras: {e}")
+            return
 
-    try:
-        # Attach to the existing shared memory blocks
-        shm_primary = shared_memory.SharedMemory(name=shm_name_primary)
-        shm_wrist = shared_memory.SharedMemory(name=shm_name_wrist)
+    # Retry loop for robust connection
+    max_retries = 5
+    retry_count = 0
 
-        # Create NumPy arrays backed by the shared memory buffers
-        shared_frame_primary = np.ndarray(
-            shape, dtype=dtype, buffer=shm_primary.buf)
-        shared_frame_wrist = np.ndarray(
-            shape, dtype=dtype, buffer=shm_wrist.buf)
+    while not stop_event.is_set() and retry_count < max_retries:
+        try:
+            print(
+                f"📸 Attempt {retry_count + 1}/{max_retries} to start cameras...")
 
-        # Initialize RealSense pipeline
-        pipeline_primary = rs.pipeline()
-        pipeline_wrist = rs.pipeline()
+            # Attach to shared memory
+            shm_primary = shared_memory.SharedMemory(name=shm_name_primary)
+            shm_wrist = shared_memory.SharedMemory(name=shm_name_wrist)
 
-        config_primary = rs.config()
-        config_wrist = rs.config()
+            # Create NumPy array views
+            shared_frame_primary = np.ndarray(
+                shape, dtype=dtype, buffer=shm_primary.buf)
+            shared_frame_wrist = np.ndarray(
+                shape, dtype=dtype, buffer=shm_wrist.buf)
 
-        if primary_serial:
+            # Initialize RealSense pipelines
+            pipeline_primary = rs.pipeline()
+            pipeline_wrist = rs.pipeline()
+
+            config_primary = rs.config()
+            config_wrist = rs.config()
+
             config_primary.enable_device(primary_serial)
-        if wrist_serial:
             config_wrist.enable_device(wrist_serial)
 
-        config_primary.enable_stream(
-            rs.stream.color, 640, 480, rs.format.bgr8, 30)
-        config_wrist.enable_stream(
-            rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            config_primary.enable_stream(
+                rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            config_wrist.enable_stream(
+                rs.stream.color, 640, 480, rs.format.bgr8, 30)
 
-        # Start cameras
-        pipeline_primary.start(config_primary)
-        pipeline_wrist.start(config_wrist)
+            # Try to start pipelines - this is where "device busy" errors occur
+            print(f"📸 Starting pipeline for camera {primary_serial}...")
+            pipeline_primary.start(config_primary)
 
-        print("📸 Camera processes started with shared memory")
+            print(f"📸 Starting pipeline for camera {wrist_serial}...")
+            pipeline_wrist.start(config_wrist)
 
-        frame_count = 0
-        last_fps_time = time.time()
+            print("✅ Both camera pipelines started successfully!")
 
-        while not stop_event.is_set():
-            try:
-                # Capture frames (this is fast since we're in a dedicated process)
-                frames_primary = pipeline_primary.wait_for_frames()
-                frames_wrist = pipeline_wrist.wait_for_frames()
+            # Main capture loop
+            frame_count = 0
+            last_fps_time = time.time()
 
-                color_frame_primary = frames_primary.get_color_frame()
-                color_frame_wrist = frames_wrist.get_color_frame()
+            while not stop_event.is_set():
+                try:
+                    # Capture frames
+                    frames_primary = pipeline_primary.wait_for_frames()
+                    frames_wrist = pipeline_wrist.wait_for_frames()
 
-                if color_frame_primary and color_frame_wrist:
-                    # Convert to numpy arrays
-                    img_primary = np.asanyarray(color_frame_primary.get_data())
-                    img_wrist = np.asanyarray(color_frame_wrist.get_data())
+                    color_frame_primary = frames_primary.get_color_frame()
+                    color_frame_wrist = frames_wrist.get_color_frame()
 
-                    # Write directly into shared memory (atomic operation)
-                    shared_frame_primary[:] = img_primary[:]
-                    shared_frame_wrist[:] = img_wrist[:]
+                    if color_frame_primary and color_frame_wrist:
+                        # Convert to numpy arrays
+                        img_primary = np.asanyarray(
+                            color_frame_primary.get_data())
+                        img_wrist = np.asanyarray(color_frame_wrist.get_data())
 
-                    frame_count += 1
+                        # Write directly into shared memory (atomic operation)
+                        shared_frame_primary[:] = img_primary[:]
+                        shared_frame_wrist[:] = img_wrist[:]
 
-                    # Print FPS occasionally
-                    if frame_count % 30 == 0:
-                        current_time = time.time()
-                        fps = 30 / (current_time - last_fps_time)
-                        print(f"📸 Camera FPS: {fps:.1f}")
-                        last_fps_time = current_time
+                        frame_count += 1
 
-                # Small sleep to prevent 100% CPU usage
-                time.sleep(0.001)
+                        # Print FPS occasionally
+                        if frame_count % 30 == 0:
+                            current_time = time.time()
+                            fps = 30 / (current_time - last_fps_time)
+                            print(f"📸 Camera FPS: {fps:.1f}")
+                            last_fps_time = current_time
 
-            except Exception as e:
-                print(f"⚠️ Camera capture error: {e}")
-                time.sleep(0.01)
+                    # Small sleep to prevent 100% CPU usage
+                    time.sleep(0.001)
 
-    except Exception as e:
-        print(f"❌ Camera process error: {e}")
-    finally:
-        try:
+                except Exception as e:
+                    print(f"⚠️ Camera capture error: {e}")
+                    time.sleep(0.01)
+
+            # If we get here, stop_event was set - clean exit
+            print("📸 Camera process stopping normally")
+            break
+
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "Device or resource busy" in error_msg or "No device connected" in error_msg:
+                print(
+                    f"⚠️ Camera busy/disconnected error on attempt {retry_count + 1}: {e}")
+
+                # Clean up any partially initialized resources
+                try:
+                    if pipeline_primary:
+                        pipeline_primary.stop()
+                    if pipeline_wrist:
+                        pipeline_wrist.stop()
+                except Exception:
+                    pass
+                pipeline_primary = None
+                pipeline_wrist = None
+
+                # 👇 --- SELF-CONTAINED RESET LOGIC ---
+                print("🔄 Attempting hardware reset...")
+                try:
+                    ctx = rs.context()
+                    devices = ctx.query_devices()
+                    reset_count = 0
+
+                    for dev in devices:
+                        dev_serial = dev.get_info(rs.camera_info.serial_number)
+                        if dev_serial == primary_serial or dev_serial == wrist_serial:
+                            print(f"📸 Resetting camera {dev_serial}...")
+                            dev.hardware_reset()
+                            reset_count += 1
+
+                    if reset_count > 0:
+                        print(
+                            f"⏳ Reset {reset_count} camera(s). Waiting 5 seconds...")
+                        time.sleep(5)
+                    else:
+                        print("⚠️ No cameras found to reset")
+
+                except Exception as reset_error:
+                    print(f"⚠️ Reset failed: {reset_error}")
+                # --- END OF RESET LOGIC ---
+
+                retry_count += 1
+                if retry_count < max_retries:
+                    print(
+                        f"🔄 Retrying in 2 seconds... ({retry_count}/{max_retries})")
+                    time.sleep(2)
+                else:
+                    print(
+                        f"❌ Failed to start cameras after {max_retries} attempts")
+                    break
+
+            else:
+                print(f"❌ Unhandled camera error: {e}")
+                break
+
+        except Exception as e:
+            print(f"❌ Critical camera process error: {e}")
+            break
+
+    # Cleanup
+    print("🛑 Camera process cleanup...")
+    try:
+        if pipeline_primary:
             pipeline_primary.stop()
+        if pipeline_wrist:
             pipeline_wrist.stop()
+        if shm_primary:
             shm_primary.close()
+        if shm_wrist:
             shm_wrist.close()
-            print("📸 Camera processes stopped")
-        except Exception:
-            pass
+        print("✅ Camera cleanup complete")
+    except Exception as e:
+        print(f"⚠️ Cleanup error: {e}")
 
 
 def dummy_camera_process(shm_name_primary, shm_name_wrist, shape, dtype, stop_event):
