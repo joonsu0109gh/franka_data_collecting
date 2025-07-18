@@ -1,11 +1,15 @@
 import time
 import config
+import numpy as np
+from multiprocessing import Process, shared_memory, Event
 
 # Import our modular classes
 from src.input_manager import SpaceMouseManager
 from src.policy import TeleopPolicy
 from src.incremental_recorder import IncrementalDataRecorder
 from src.robot_interface import RobotInterface
+from src.utils import Rate
+from src.camera_reader import camera_process_realsense, dummy_camera_process
 
 
 class DataCollectionController:
@@ -39,12 +43,83 @@ class DataCollectionController:
         )
         self.recorder = IncrementalDataRecorder(self.data_log_root)
 
-        # Initialize cameras
-        print("Initializing cameras...")
-        camera_success = self.recorder.initialize_cameras(
+        # Initialize cameras with shared memory for fast access
+        print("Initializing shared memory cameras...")
+        camera_success = self._initialize_shared_memory_cameras(
             primary_camera_serial, wrist_camera_serial)
         if not camera_success:
             print("⚠️ Camera initialization failed. Continuing without cameras.")
+
+        # Initialize precise rate limiter for stable control loop
+        self.rate_limiter = Rate(self.loop_rate_hz)
+
+    def _initialize_shared_memory_cameras(self, primary_serial=None, wrist_serial=None):
+        """Initialize shared memory cameras for fast, non-blocking access."""
+        try:
+            # Define camera properties
+            self.cam_shape = (480, 640, 3)  # Height, Width, Channels
+            self.cam_dtype = np.uint8
+            frame_size = int(np.prod(self.cam_shape) *
+                             np.dtype(self.cam_dtype).itemsize)
+
+            # Create shared memory blocks for both cameras
+            self.shm_primary = shared_memory.SharedMemory(
+                create=True, size=frame_size)
+            self.shm_wrist = shared_memory.SharedMemory(
+                create=True, size=frame_size)
+
+            # Create NumPy array views for easy access
+            self.latest_frame_primary = np.ndarray(
+                self.cam_shape, dtype=self.cam_dtype, buffer=self.shm_primary.buf)
+            self.latest_frame_wrist = np.ndarray(
+                self.cam_shape, dtype=self.cam_dtype, buffer=self.shm_wrist.buf)
+
+            # Initialize with black frames
+            self.latest_frame_primary.fill(0)
+            self.latest_frame_wrist.fill(0)
+
+            # Start camera process
+            self.camera_stop_event = Event()
+
+            # Try RealSense cameras first, fall back to dummy if not available
+            try:
+                self.camera_process = Process(
+                    target=camera_process_realsense,
+                    args=(self.shm_primary.name, self.shm_wrist.name,
+                          self.cam_shape, self.cam_dtype, self.camera_stop_event,
+                          primary_serial, wrist_serial)
+                )
+                print("📸 Starting RealSense camera processes...")
+            except Exception:
+                self.camera_process = Process(
+                    target=dummy_camera_process,
+                    args=(self.shm_primary.name, self.shm_wrist.name,
+                          self.cam_shape, self.cam_dtype, self.camera_stop_event)
+                )
+                print("📸 Starting dummy camera processes...")
+
+            self.camera_process.start()
+
+            # Give cameras time to initialize
+            time.sleep(2.0)
+
+            return True
+
+        except Exception as e:
+            print(f"❌ Shared memory camera initialization failed: {e}")
+            return False
+
+    def get_camera_images(self):
+        """Get the latest camera images from shared memory (non-blocking)."""
+        try:
+            # Copy to avoid race conditions (this is very fast)
+            img_primary = self.latest_frame_primary.copy()
+            img_wrist = self.latest_frame_wrist.copy()
+            return img_primary, img_wrist
+        except Exception:
+            # Return dummy images if something goes wrong
+            dummy_img = np.zeros(self.cam_shape, dtype=self.cam_dtype)
+            return dummy_img, dummy_img
 
     def collect_episode(self, language_instruction: str, episode_num: int, total_episodes: int):
         """Collect a single episode of demonstration data."""
@@ -68,14 +143,14 @@ class DataCollectionController:
         print("="*60 + "\n")
 
         step_count = 0
-        control_loop_times = []  # Track actual control loop performance
         both_buttons_start_time = None  # Track when both buttons were pressed
         episode_ending = False  # Track if episode is ending to skip recording
-        target_loop_time = 1.0 / self.loop_rate_hz  # Cache this calculation
+
+        # Reset the rate limiter for this episode
+        self.rate_limiter.reset()
 
         try:
             while True:
-                start_time = time.time()
 
                 # 1. Get current robot state (Observation) - minimize latency
                 current_obs = self.robot.get_obs()
@@ -84,7 +159,7 @@ class DataCollectionController:
                 # 2. Get user input
                 mouse_state = self.mouse.get_state()
                 if mouse_state is None:
-                    time.sleep(target_loop_time)
+                    time.sleep(0.1)  # Small sleep if no mouse data
                     continue
 
                 # Parse button states for different SpaceMouse models
@@ -116,7 +191,7 @@ class DataCollectionController:
                         print(
                             "🗑️ Skipping data recording during episode transition...")
                     elif time.time() - both_buttons_start_time >= 3.0:
-                        recorded_timesteps = step_count // 15  # Actual recorded data points
+                        recorded_timesteps = step_count // 50  # Actual recorded data points
                         print(
                             f"\n🛑 Episode {episode_num} ended by user. Recorded {recorded_timesteps} timesteps ({step_count} control steps).")
                         break
@@ -135,48 +210,58 @@ class DataCollectionController:
                     self.robot.set_gripper_button_state(
                         button_left, button_right)
 
-                # 6. Record the timestep (make it truly asynchronous)
-                # Record less frequently to maintain control loop speed
-                # Skip recording if episode is ending
-                if not episode_ending and step_count % 15 == 0:  # Record every 15th iteration for better performance
+                # 6. Record the timestep (much less frequently to maintain 10Hz control)
+                # Record every 50th iteration to get ~0.2Hz recording rate at 10Hz control
+                # This ensures control loop stays fast while still capturing essential data
+                if not episode_ending and step_count % 50 == 0:
                     try:
-                        self.recorder.record_timestep(
-                            current_obs, action, language_instruction)
+                        # TEMPORARILY DISABLE CAMERA RECORDING TO TEST PERFORMANCE
+                        # Get camera images from shared memory (fast, non-blocking)
+                        # img_primary, img_wrist = self.get_camera_images()
+
+                        # Use threading to make recording non-blocking
+                        import threading
+                        recording_thread = threading.Thread(
+                            target=self.recorder.record_timestep,
+                            args=(current_obs, action, language_instruction),
+                            daemon=True
+                        )
+                        recording_thread.start()
                     except Exception as e:
                         print(f"⚠️ Recording error (continuing): {e}")
 
                 step_count += 1  # Always increment step count
 
-                # Track control loop performance (smaller buffer for better performance)
-                loop_time = time.time() - start_time
-                control_loop_times.append(loop_time)
-                if len(control_loop_times) > 50:  # Smaller buffer: 50 instead of 100
-                    control_loop_times.pop(0)  # Keep last 50 measurements
+                # Monitor control loop performance less frequently to reduce overhead
+                # Check every 100 steps (~10 seconds at 10Hz)
+                if step_count % 100 == 0 and step_count > 0:
+                    actual_hz = self.rate_limiter.get_actual_rate()
+                    recorded_timesteps = step_count // 50  # Actual recorded data points
 
-                # Print status less frequently to avoid slowing down the loop
-                if step_count % 150 == 0 and step_count > 0:  # Print every 150 steps for less console overhead
-                    avg_loop_time = sum(control_loop_times) / \
-                        len(control_loop_times)
-                    actual_hz = 1.0 / avg_loop_time if avg_loop_time > 0 else 0
-                    recorded_timesteps = step_count // 15  # Actual recorded data points
+                    # Check if rate is within bounds (9.7-10.3Hz)
+                    if not self.rate_limiter.is_rate_stable():
+                        if actual_hz > 10.3:
+                            print(
+                                f"⚠️ Rate too high: {actual_hz:.2f}Hz > 10.3Hz")
+                        elif actual_hz < 9.7:
+                            print(
+                                f"⚠️ Rate too low: {actual_hz:.2f}Hz < 9.7Hz")
+
                     print(
-                        f"📊 Episode {episode_num}: {recorded_timesteps} recorded timesteps ({step_count} control steps) | Control loop: {actual_hz:.1f}Hz (target: {self.loop_rate_hz}Hz)")
+                        f"📊 Episode {episode_num}: {recorded_timesteps} recorded timesteps ({step_count} control steps) | Control loop: {actual_hz:.2f}Hz (target: {self.loop_rate_hz}Hz)")
 
-                # Maintain a consistent loop rate with more precise timing
-                elapsed_time = time.time() - start_time
-                sleep_time = target_loop_time - elapsed_time
-                if sleep_time > 0:
-                    time.sleep(sleep_time)
+                # Maintain precise 10Hz control loop using Rate class
+                self.rate_limiter.sleep()
 
         except KeyboardInterrupt:
-            recorded_timesteps = step_count // 15  # Actual recorded data points
+            recorded_timesteps = step_count // 50  # Actual recorded data points
             print(
                 f"\n🛑 Episode {episode_num} interrupted by Ctrl+C. Recorded {recorded_timesteps} timesteps ({step_count} control steps).")
 
         print(f"📁 Saved to: {episode_dir}")
         # Clear any residual control signals after episode
         self._clear_control_signals()
-        recorded_timesteps = step_count // 15  # Return actual recorded timesteps
+        recorded_timesteps = step_count // 50  # Return actual recorded timesteps
         return recorded_timesteps
 
     def _reset_for_new_episode(self):
@@ -311,8 +396,26 @@ class DataCollectionController:
             print("🔄 Shutting down...")
             self.mouse.stop()
             self.recorder.cleanup()
+            self._cleanup_cameras()
             self.robot.end()
             print("✅ Shutdown complete.")
+
+    def _cleanup_cameras(self):
+        """Clean up shared memory cameras."""
+        try:
+            if hasattr(self, 'camera_stop_event'):
+                self.camera_stop_event.set()
+            if hasattr(self, 'camera_process'):
+                self.camera_process.join(timeout=5.0)
+            if hasattr(self, 'shm_primary'):
+                self.shm_primary.close()
+                self.shm_primary.unlink()
+            if hasattr(self, 'shm_wrist'):
+                self.shm_wrist.close()
+                self.shm_wrist.unlink()
+            print("📸 Camera resources cleaned up")
+        except Exception as e:
+            print(f"⚠️ Camera cleanup error: {e}")
 
 
 def main():
