@@ -191,25 +191,15 @@ class RealTimeRobotInterface:
                         self._gripper_command = None
 
                 if command == "open":
-                    print("Opening gripper...")
-                    success = self.gripper.move(width=0.08, speed=0.05)
-                    if success:
-                        print("Release successful")
-                    else:
-                        print("Release failed")
+                    self.gripper.move(width=0.08, speed=0.05)
                 elif command == "close":
-                    print("Closing gripper...")
-                    success = self.gripper.grasp(
+                    self.gripper.grasp(
                         width=0.01, speed=0.05, force=20,
                         epsilon_inner=0.005, epsilon_outer=0.005
                     )
-                    if success:
-                        print("Grasp successful")
-                    else:
-                        print("Grasp failed")
 
-            except Exception as e:
-                print(f"⚠️ Gripper control error: {e}")
+            except Exception:
+                pass  # Silently continue on gripper errors to maintain control loop speed
 
             time.sleep(0.01)  # 100Hz check rate
 
@@ -246,12 +236,10 @@ class RealTimeRobotInterface:
         # Only trigger on button press (rising edge), not continuous press
         # Left button just pressed
         if button_0_pressed and not self._last_button_state[0]:
-            print("🔘 Left button pressed - closing gripper")
             with self._gripper_lock:
                 self._gripper_command = "close"
         # Right button just pressed
         elif button_1_pressed and not self._last_button_state[1]:
-            print("🔘 Right button pressed - opening gripper")
             with self._gripper_lock:
                 self._gripper_command = "open"
 

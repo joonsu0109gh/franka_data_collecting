@@ -71,6 +71,7 @@ class DataCollectionController:
         control_loop_times = []  # Track actual control loop performance
         both_buttons_start_time = None  # Track when both buttons were pressed
         episode_ending = False  # Track if episode is ending to skip recording
+        target_loop_time = 1.0 / self.loop_rate_hz  # Cache this calculation
 
         try:
             while True:
@@ -83,7 +84,7 @@ class DataCollectionController:
                 # 2. Get user input
                 mouse_state = self.mouse.get_state()
                 if mouse_state is None:
-                    time.sleep(1 / self.loop_rate_hz)
+                    time.sleep(target_loop_time)
                     continue
 
                 # Parse button states for different SpaceMouse models
@@ -104,7 +105,7 @@ class DataCollectionController:
                     elif len(mouse_state.buttons) == 1:
                         # Some SpaceMouse models only report one button
                         button_left = mouse_state.buttons[0]
-                        print("⚠️ Only one button detected on SpaceMouse")
+                        # Remove print to avoid slowing down control loop
 
                 # Check for both buttons held for episode end
                 if button_left and button_right:  # Both buttons pressed
@@ -115,8 +116,9 @@ class DataCollectionController:
                         print(
                             "🗑️ Skipping data recording during episode transition...")
                     elif time.time() - both_buttons_start_time >= 3.0:
+                        recorded_timesteps = step_count // 15  # Actual recorded data points
                         print(
-                            f"\n🛑 Episode {episode_num} ended by user. Recorded {step_count} timesteps.")
+                            f"\n🛑 Episode {episode_num} ended by user. Recorded {recorded_timesteps} timesteps ({step_count} control steps).")
                         break
                 else:
                     both_buttons_start_time = None  # Reset if buttons released
@@ -134,44 +136,48 @@ class DataCollectionController:
                         button_left, button_right)
 
                 # 6. Record the timestep (make it truly asynchronous)
-                # Only record every N iterations to maintain control loop speed
+                # Record less frequently to maintain control loop speed
                 # Skip recording if episode is ending
-                if not episode_ending and step_count % 5 == 0:  # Record every 5th iteration instead of every iteration
+                if not episode_ending and step_count % 15 == 0:  # Record every 15th iteration for better performance
                     try:
                         self.recorder.record_timestep(
                             current_obs, action, language_instruction)
-                        step_count += 1
                     except Exception as e:
                         print(f"⚠️ Recording error (continuing): {e}")
-                else:
-                    step_count += 1  # Still count timesteps even if not recording
 
-                # Track control loop performance
+                step_count += 1  # Always increment step count
+
+                # Track control loop performance (smaller buffer for better performance)
                 loop_time = time.time() - start_time
                 control_loop_times.append(loop_time)
-                if len(control_loop_times) > 100:
-                    control_loop_times.pop(0)  # Keep last 100 measurements
+                if len(control_loop_times) > 50:  # Smaller buffer: 50 instead of 100
+                    control_loop_times.pop(0)  # Keep last 50 measurements
 
-                if step_count % 50 == 0 and step_count > 0:
+                # Print status less frequently to avoid slowing down the loop
+                if step_count % 150 == 0 and step_count > 0:  # Print every 150 steps for less console overhead
                     avg_loop_time = sum(control_loop_times) / \
                         len(control_loop_times)
                     actual_hz = 1.0 / avg_loop_time if avg_loop_time > 0 else 0
+                    recorded_timesteps = step_count // 15  # Actual recorded data points
                     print(
-                        f"📊 Episode {episode_num}: {step_count} timesteps | Control loop: {actual_hz:.1f}Hz (target: {self.loop_rate_hz}Hz)")
+                        f"📊 Episode {episode_num}: {recorded_timesteps} recorded timesteps ({step_count} control steps) | Control loop: {actual_hz:.1f}Hz (target: {self.loop_rate_hz}Hz)")
 
-                # Maintain a consistent loop rate
+                # Maintain a consistent loop rate with more precise timing
                 elapsed_time = time.time() - start_time
-                sleep_time = max(0, (1 / self.loop_rate_hz) - elapsed_time)
-                time.sleep(sleep_time)
+                sleep_time = target_loop_time - elapsed_time
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
 
         except KeyboardInterrupt:
+            recorded_timesteps = step_count // 15  # Actual recorded data points
             print(
-                f"\n🛑 Episode {episode_num} interrupted by Ctrl+C. Recorded {step_count} timesteps.")
+                f"\n🛑 Episode {episode_num} interrupted by Ctrl+C. Recorded {recorded_timesteps} timesteps ({step_count} control steps).")
 
         print(f"📁 Saved to: {episode_dir}")
         # Clear any residual control signals after episode
         self._clear_control_signals()
-        return step_count
+        recorded_timesteps = step_count // 15  # Return actual recorded timesteps
+        return recorded_timesteps
 
     def _reset_for_new_episode(self):
         """Reset robot state and clear control signals for new episode."""
