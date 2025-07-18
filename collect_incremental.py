@@ -113,8 +113,20 @@ class DataCollectionController:
             # Copy to avoid race conditions (this is very fast)
             img_primary = self.latest_frame_primary.copy()
             img_wrist = self.latest_frame_wrist.copy()
+
+            # Debug: Check if images have actual data
+            primary_sum = np.sum(img_primary)
+            wrist_sum = np.sum(img_wrist)
+
+            if primary_sum == 0 and wrist_sum == 0:
+                print("⚠️ Camera images are all zeros - no data from camera process")
+            else:
+                print(
+                    f"📸 Camera data: Primary sum={primary_sum}, Wrist sum={wrist_sum}")
+
             return img_primary, img_wrist
-        except Exception:
+        except Exception as e:
+            print(f"❌ Error getting camera images: {e}")
             # Return dummy images if something goes wrong
             dummy_img = np.zeros(self.cam_shape, dtype=self.cam_dtype)
             return dummy_img, dummy_img
@@ -213,15 +225,15 @@ class DataCollectionController:
                 # This ensures control loop stays fast while still capturing essential data
                 if not episode_ending and step_count % 50 == 0:
                     try:
-                        # TEMPORARILY DISABLE CAMERA RECORDING TO TEST PERFORMANCE
                         # Get camera images from shared memory (fast, non-blocking)
-                        # img_primary, img_wrist = self.get_camera_images()
+                        img_primary, img_wrist = self.get_camera_images()
 
                         # Use threading to make recording non-blocking
                         import threading
                         recording_thread = threading.Thread(
-                            target=self.recorder.record_timestep,
-                            args=(current_obs, action, language_instruction),
+                            target=self.recorder.record_timestep_with_images,
+                            args=(current_obs, action,
+                                  language_instruction, img_primary, img_wrist),
                             daemon=True
                         )
                         recording_thread.start()
