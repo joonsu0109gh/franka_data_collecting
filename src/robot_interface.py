@@ -338,6 +338,63 @@ class RealTimeRobotInterface:
         except Exception as e:
             print(f"⚠️ Could not reset joints: {e}")
 
+    def reset_to_home_pose_realtime(self):
+        """Reset robot to home position within real-time control context."""
+        try:
+            # Clear any movement deltas first
+            with self._command_lock:
+                self._delta_translation = np.zeros(3, dtype=np.float32)
+                self._delta_rotation = np.zeros(3, dtype=np.float32)
+
+            print("🏠 Reset to home pose (clearing movement commands)")
+        except Exception as e:
+            print(f"⚠️ Could not reset to home pose: {e}")
+
+    def safe_episode_reset(self):
+        """Safely reset robot for new episode by temporarily stopping real-time control."""
+        try:
+            print("🔄 Stopping real-time control for safe reset...")
+
+            # Stop the real-time control temporarily
+            self._stop_event.set()
+            if self._control_thread and self._control_thread.is_alive():
+                self._control_thread.join(timeout=3.0)
+
+            # Now safely reset to home position
+            home_pose = np.array([
+                [-0.01588696],
+                [-0.25534376],
+                [0.18628714],
+                [-2.28398158],
+                [0.0769999],
+                [2.02505396],
+                [0.07858208]
+            ], dtype=np.float64).flatten()
+            self.panda.move_to_joint_position(home_pose)  # type: ignore
+
+            # Clear movement deltas
+            with self._command_lock:
+                self._delta_translation = np.zeros(3, dtype=np.float32)
+                self._delta_rotation = np.zeros(3, dtype=np.float32)
+
+            # Restart real-time control
+            print("🔄 Restarting real-time control...")
+            self._stop_event.clear()
+            self._ready_event.clear()
+            self._control_thread = threading.Thread(
+                target=self._realtime_control_loop, daemon=True)
+            self._control_thread.start()
+
+            # Wait for control loop to be ready
+            if not self._ready_event.wait(timeout=10.0):
+                raise RuntimeError("Real-time control loop failed to restart")
+
+            print("✅ Episode reset complete with real-time control restarted")
+
+        except Exception as e:
+            print(f"⚠️ Could not perform safe episode reset: {e}")
+            raise
+
     def stop(self):
         """Stop the real-time control loop."""
         self._stop_event.set()

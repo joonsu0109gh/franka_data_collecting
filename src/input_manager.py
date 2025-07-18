@@ -50,3 +50,7 @@ class SpaceMouseManager:
             self.process.terminate()
             self.process.join()
             print("SpaceMouse process stopped.")
+
+    def is_alive(self):
+        """Check if the SpaceMouse process is still running."""
+        return self.process is not None and self.process.is_alive()
