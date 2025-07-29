@@ -5,14 +5,102 @@ from typing import Dict, Any
 from multiprocessing.managers import SharedMemoryManager
 from franka.utils.shared_memory.shared_memory_ring_buffer import SharedMemoryRingBuffer
 from scipy.spatial.transform import Rotation as R
+import franky
+from franky import Robot, JointMotion, ReferenceType
 
-# Constants for movement (3x faster than working example)
-MOVE_INCREMENT = 0.003
+
+class FrankaRobotWrapper:
+    """Wrapper for franky Robot to provide cartesian velocity control."""
+    
+    def __init__(self, robot_ip):
+        self.robot = Robot(robot_ip)
+        self.robot.recover_from_errors()
+        self.gripper = franky.Gripper(robot_ip)
+        
+        # Set lower dynamics to avoid velocity discontinuities (match working example)
+        try:
+            self.robot.relative_dynamics_factor = 0.1  # Match the working example
+            print("[FrankaRobotWrapper] Set relative dynamics factor to 0.1")
+        except Exception as e:
+            print(f"[FrankaRobotWrapper] Could not set dynamics: {e}")
+        
+    def cartesian_velocity_control(self, velocity_cmd):
+        """Cartesian velocity control compatible with reference code."""
+        try:
+            from franky import CartesianVelocityMotion, Twist
+            
+            # Extract velocity components
+            x = velocity_cmd.get("x", 0.0)
+            y = velocity_cmd.get("y", 0.0) 
+            z = velocity_cmd.get("z", 0.0)
+            R = velocity_cmd.get("R", 0.0)
+            P = velocity_cmd.get("P", 0.0)
+            Y = velocity_cmd.get("Y", 0.0)
+            # No duration needed - franky handles this automatically
+            
+            # Clamp velocities to robot limits (conservative for franky)
+            # Higher velocity limits for more responsive movement
+            max_linear_vel = 0.15   # 15cm/s - faster but safe speed
+            max_angular_vel = 0.3   # 0.3 rad/s - faster angular speed
+            
+            x = max(-max_linear_vel, min(max_linear_vel, x))
+            y = max(-max_linear_vel, min(max_linear_vel, y))
+            z = max(-max_linear_vel, min(max_linear_vel, z))
+            R = max(-max_angular_vel, min(max_angular_vel, R))
+            P = max(-max_angular_vel, min(max_angular_vel, P))
+            Y = max(-max_angular_vel, min(max_angular_vel, Y))
+            
+            # Skip if all velocities are zero after clamping
+            if abs(x) < 1e-6 and abs(y) < 1e-6 and abs(z) < 1e-6 and abs(R) < 1e-6 and abs(P) < 1e-6 and abs(Y) < 1e-6:
+                return
+            
+            # Use simple franky API like the working example
+            # Create motion with simple Twist constructor 
+            motion = CartesianVelocityMotion(Twist(np.array([x, y, z])))
+            
+            # Execute motion (always async for velocity control)
+            self.robot.move(motion, asynchronous=True)
+            
+        except Exception as e:
+            # Handle reflex mode automatically
+            if "Reflex" in str(e):
+                try:
+                    print("[FrankaRobotWrapper] Reflex mode detected, recovering...")
+                    self.robot.recover_from_errors()
+                    time.sleep(0.05)  # Brief pause after recovery (reduced from 0.1)
+                except Exception:
+                    pass  # Continue even if recovery fails
+            # Don't print every error to avoid spamming the console during real-time control
+            elif "motion_generator_velocity_discontinuity" not in str(e) and "exceeds maximum velocity" not in str(e):
+                if hasattr(self, '_last_error_time'):
+                    if time.time() - self._last_error_time > 1.0:  # Only print once per second
+                        print(f"[FrankaRobotWrapper] Velocity control error: {e}")
+                        self._last_error_time = time.time()
+                else:
+                    print(f"[FrankaRobotWrapper] Velocity control error: {e}")
+                    self._last_error_time = time.time()
+    
+    @property
+    def state(self):
+        """Get robot state."""
+        return self.robot.state
+    
+    def move(self, motion, asynchronous=False):
+        """Move robot with given motion."""
+        return self.robot.move(motion, asynchronous=asynchronous)
+    
+    def stop(self):
+        """Stop any current robot motion."""
+        return self.robot.stop()
+    
+    def join_motion(self, timeout=None):
+        """Wait for current motion to finish."""
+        return self.robot.join_motion(timeout or 10.0)
 
 
 class RealTimeRobotInterface:
     """
-    Real-time robot interface using panda_py with proper control loop and shared memory.
+    Real-time robot interface using franky with proper control loop and shared memory.
     Based on the reference implementation in robot.py but adapted for the modular system.
     """
 
@@ -69,34 +157,52 @@ class RealTimeRobotInterface:
         self._initialize_robot()
 
     def _initialize_robot(self):
-        """Initialize the robot connection."""
+        """Initialize the robot connection using franky."""
         try:
-            import panda_py
-            import panda_py.controllers
-            from panda_py import libfranka
-
-            self.panda = panda_py.Panda(hostname=self.robot_ip)
-            self.gripper = libfranka.Gripper(self.robot_ip)
+            self.robot = FrankaRobotWrapper(self.robot_ip)
             print(f"✅ Connected to robot at {self.robot_ip}")
 
             # Move to home position (initial setup) - matches reference robot.py
-            home_pose = np.array([
-                [-0.01588696],
-                [-0.25534376],
-                [0.18628714],
-                [-2.28398158],
-                [0.0769999],
-                [2.02505396],
-                [0.07858208]
-            ], dtype=np.float64)
+            home_pose = [
+                -0.01588696,
+                -0.25534376,
+                0.18628714,
+                -2.28398158,
+                0.0769999,
+                2.02505396,
+                0.07858208,
+            ]
 
-            self.panda.move_to_joint_position(home_pose)  # type: ignore
-            self.gripper.move(width=0.09, speed=0.1)
-            print("✅ Robot moved to home position")
+            print("✅ Moving to home position...")
+            motion = JointMotion(home_pose, reference_type=ReferenceType.Absolute)
+            
+            # Stop any existing motion first
+            try:
+                self.robot.stop()
+                time.sleep(0.5)  # Give time for robot to stop
+            except Exception:
+                pass  # Robot might not be moving
+            
+            # Use asynchronous motion and wait for completion
+            self.robot.move(motion, asynchronous=True)
+            
+            # Wait for motion to complete with timeout
+            try:
+                self.robot.join_motion(timeout=10.0)
+                print("✅ Robot moved to home position")
+            except Exception as e:
+                print(f"Home position motion may not have completed: {e}")
+
+            # Initialize gripper
+            try:
+                self.robot.gripper.move(width=0.09, speed=0.1)
+                print("✅ Gripper initialized")
+            except Exception as e:
+                print(f"Gripper initialization issue: {e}")
 
         except ImportError as e:
             raise ImportError(
-                f"panda_py library not found. Please install it with: pip install panda_py\nError: {e}"
+                f"franky library not found. Please install it with: pip install franky\nError: {e}"
             )
         except Exception as e:
             raise RuntimeError(
@@ -118,19 +224,11 @@ class RealTimeRobotInterface:
             print("✅ Real-time control started")
 
     def _realtime_control_loop(self):
-        """Real-time control loop running in separate thread - matches reference code pattern."""
+        """Real-time control loop running in separate thread using franky at 200Hz."""
         try:
-            import panda_py.controllers
-
-            # Create high-frequency control context (1000Hz like reference)
-            self.ctx = self.panda.create_context(frequency=1000)
-            self.controller = panda_py.controllers.CartesianImpedance()
-            self.panda.start_controller(self.controller)
-            time.sleep(1)  # Let controller settle like reference code
-
-            # Get initial pose (like reference code)
-            self.current_translation = self.panda.get_position()
-            self.current_rotation = self.panda.get_orientation()
+            # Signal that we're ready
+            self._ready_event.set()
+            print("🔄 Real-time control loop started at 20Hz using franky")
 
             # Start gripper control thread
             self._gripper_stop_event.clear()
@@ -138,44 +236,55 @@ class RealTimeRobotInterface:
                 target=self._gripper_control_loop, daemon=True)
             self._gripper_thread.start()
 
-            # Signal that we're ready
-            self._ready_event.set()
-            print("🔄 Real-time control loop started at 1000Hz")
+            # Control loop matching the working example (20Hz like the reference)
+            control_period = 0.05  # 50ms = 20Hz like the working example
+            iteration_count = 0
 
-            # Main real-time loop (matches working example: while ctx.ok() and not self._stop_event.is_set())
-            while self.ctx.ok() and not self._stop_event.is_set():
-                # Get movement deltas from main thread (like working example gets from spacemouse)
-                with self._command_lock:
-                    dpos = self._delta_translation * MOVE_INCREMENT
-                    drot = self._delta_rotation * MOVE_INCREMENT * 3  # Like working example
+            while not self._stop_event.is_set():
+                try:
+                    loop_start = time.time()
+                    
+                    # Get movement deltas from main thread - increase scaling for visible movement
+                    with self._command_lock:
+                        # Increase scaling for more responsive movement
+                        dpos = self._delta_translation * 1.0   # Increased for faster movement
+                        drot = self._delta_rotation * 0.5      # Increased for faster rotation
 
-                # Update translation (exactly like working example)
-                self.current_translation += np.array(
-                    [dpos[0], dpos[1], dpos[2]], dtype=np.float32)
+                    # Use franky's velocity control if there's movement
+                    if np.any(dpos != 0) or np.any(drot != 0):
+                        velocity_cmd = {
+                            "x": float(dpos[0]),
+                            "y": float(dpos[1]), 
+                            "z": float(dpos[2]),
+                            "R": float(drot[0]),
+                            "P": float(drot[1]),
+                            "Y": float(drot[2]),
+                            "is_async": True,
+                        }
+                        self.robot.cartesian_velocity_control(velocity_cmd)
 
-                # Update rotation (exactly like working example)
-                if np.any(drot != 0):
-                    delta_rotation = R.from_euler("xyz", drot, degrees=False)
-                    current_rotation_R = R.from_quat(self.current_rotation)
-                    self.current_rotation = (
-                        delta_rotation * current_rotation_R).as_quat()
+                    # Update state buffer (update every iteration at 50Hz)
+                    self._update_robot_state()
 
-                # Send to controller (like working example)
-                self.controller.set_control(
-                    self.current_translation, self.current_rotation)
+                    iteration_count += 1
+                    
+                    # Sleep for precise timing to maintain 20Hz
+                    elapsed = time.time() - loop_start
+                    sleep_time = max(0, control_period - elapsed)
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
 
-                # Update state buffer
-                self._update_robot_state()
-
-                # (The panda context handles timing automatically)
+                except Exception as e:
+                    print(f"❌ Error in control loop iteration: {e}")
+                    time.sleep(0.01)
 
             # Stop gripper thread
             self._gripper_stop_event.set()
             if self._gripper_thread:
                 self._gripper_thread.join(timeout=1.0)
 
-        except Exception:
-            print("❌ Error in real-time control loop")
+        except Exception as e:
+            print(f"❌ Error in real-time control loop: {e}")
         finally:
             print("🔄 Real-time control loop stopped")
 
@@ -191,11 +300,10 @@ class RealTimeRobotInterface:
                         self._gripper_command = None
 
                 if command == "open":
-                    self.gripper.move(width=0.08, speed=0.05)
+                    self.robot.gripper.move(width=0.08, speed=0.05)
                 elif command == "close":
-                    self.gripper.grasp(
-                        width=0.01, speed=0.05, force=20,
-                        epsilon_inner=0.005, epsilon_outer=0.005
+                    self.robot.gripper.grasp(
+                        width=0.01, speed=0.05, force=20
                     )
 
             except Exception:
@@ -204,22 +312,25 @@ class RealTimeRobotInterface:
             time.sleep(0.01)  # 100Hz check rate
 
     def _update_robot_state(self):
-        """Update the shared robot state buffer."""
+        """Update the shared robot state buffer using franky robot state."""
         try:
-            robot_state = self.panda.get_state()
-            gripper_state = self.gripper.read_once()
-
+            gripper_width = self.robot.gripper.width
+            robot_state = self.robot.state
+            ee_pose = robot_state.O_T_EE
+            ee_pos = ee_pose.translation
+            ee_ori = ee_pose.quaternion
+            
             state_data = {
                 "q": robot_state.q,
                 "dq": robot_state.dq,
                 "tau_J": robot_state.tau_J,
-                "EE_position": self.current_translation,
-                "EE_orientation": self.current_rotation,
-                "gripper_state": gripper_state.width
+                "EE_position": ee_pos,
+                "EE_orientation": ee_ori,
+                "gripper_state": gripper_width
             }
 
             self.robot_state_buffer.put(state_data)
-        except Exception as e:
+        except Exception:
             pass  # Don't spam errors in real-time loop
 
     def set_movement_delta(self, translation_delta, rotation_delta):
@@ -313,16 +424,30 @@ class RealTimeRobotInterface:
     def reset_joints(self):
         """Reset robot to home position."""
         try:
-            home_pose = np.array([
-                [-0.01588696],
-                [-0.25534376],
-                [0.18628714],
-                [-2.28398158],
-                [0.0769999],
-                [2.02505396],
-                [0.07858208]
-            ], dtype=np.float64)
-            self.panda.move_to_joint_position(home_pose)  # type: ignore
+            home_pose = [
+                -0.01588696,
+                -0.25534376,
+                0.18628714,
+                -2.28398158,
+                0.0769999,
+                2.02505396,
+                0.07858208,
+            ]
+
+            print("🏠 Moving to home position...")
+            motion = JointMotion(home_pose, reference_type=ReferenceType.Absolute)
+            
+            # Stop any existing motion first
+            try:
+                self.robot.stop()
+                time.sleep(0.5)  # Give time for robot to stop
+            except Exception:
+                pass  # Robot might not be moving
+            
+            # Use synchronous motion for reset
+            self.robot.move(motion, asynchronous=False)
+            print("✅ Robot moved to home position")
+            
         except Exception as e:
             print(f"⚠️ Could not reset joints: {e}")
 
@@ -348,17 +473,19 @@ class RealTimeRobotInterface:
             if self._control_thread and self._control_thread.is_alive():
                 self._control_thread.join(timeout=3.0)
 
-            # Now safely reset to home position
-            home_pose = np.array([
-                [-0.01588696],
-                [-0.25534376],
-                [0.18628714],
-                [-2.28398158],
-                [0.0769999],
-                [2.02505396],
-                [0.07858208]
-            ], dtype=np.float64).flatten()
-            self.panda.move_to_joint_position(home_pose)  # type: ignore
+            # Now safely reset to home position using franky
+            home_pose = [
+                -0.01588696,
+                -0.25534376,
+                0.18628714,
+                -2.28398158,
+                0.0769999,
+                2.02505396,
+                0.07858208,
+            ]
+            
+            motion = JointMotion(home_pose, reference_type=ReferenceType.Absolute)
+            self.robot.move(motion, asynchronous=False)
 
             # Clear movement deltas
             with self._command_lock:

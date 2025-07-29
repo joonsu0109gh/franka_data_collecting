@@ -60,5 +60,15 @@ class TeleopPolicy:
             'ee_pose': target_pose,
             'gripper_width': gripper_width,
             'delta_translation': delta_translation,  # For real-time control
-            'delta_rotation': delta_rotation  # For real-time control
+            'delta_rotation': delta_rotation,  # For real-time control
+            'velocity_cmd': {  # For franky velocity control
+                "x": float(delta_translation[0] * 10),  # Scale up for velocity
+                "y": float(delta_translation[1] * 10),
+                "z": float(delta_translation[2] * 10),
+                "R": float(delta_rotation[0] * 2),
+                "P": float(delta_rotation[1] * 2),
+                "Y": float(delta_rotation[2] * 2),
+                "duration": 100,  # 100ms duration
+                "is_async": True,
+            }
         }
