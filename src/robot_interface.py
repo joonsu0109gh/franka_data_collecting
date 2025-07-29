@@ -129,7 +129,7 @@ class RealTimeRobotInterface:
             examples=robot_state,
             get_max_k=32,
             get_time_budget=0.1,
-            put_desired_frequency=20
+            put_desired_frequency=15
         )
 
         # Control threading
@@ -233,11 +233,11 @@ class RealTimeRobotInterface:
             print("✅ Real-time control started")
 
     def _realtime_control_loop(self):
-        """Real-time control loop running in separate thread using franky at higher frequency."""
+        """Real-time control loop running in separate thread using franky at 1kHz frequency."""
         try:
             # Signal that we're ready
             self._ready_event.set()
-            print("🔄 Real-time control loop started at 100Hz using franky")
+            print("🔄 Real-time control loop started at 1000Hz using franky")
 
             # Start gripper control thread
             self._gripper_stop_event.clear()
@@ -245,14 +245,13 @@ class RealTimeRobotInterface:
                 target=self._gripper_control_loop, daemon=True)
             self._gripper_thread.start()
 
-            # Higher frequency control loop for more responsive robot control
-            control_period = 0.01  # 10ms = 100Hz for much more responsive control
+            # Ultra-high frequency control loop for maximum responsiveness
+            control_period = 0.001  # 1ms = 1000Hz for maximum responsiveness
             iteration_count = 0
+            next_iteration_time = time.time()  # Track absolute timing for precise frequency
 
             while not self._stop_event.is_set():
-                try:
-                    loop_start = time.time()
-                    
+                try:                    
                     # Get movement deltas from main thread - scale significantly for velocity control
                     with self._command_lock:
                         # Scale deltas to proper velocities for responsive movement
@@ -273,16 +272,28 @@ class RealTimeRobotInterface:
                         }
                         self.robot.cartesian_velocity_control(velocity_cmd)
 
-                    # Update state buffer (update every iteration at 100Hz)
-                    self._update_robot_state()
+                    # Update state buffer (only every 10th iteration to reduce overhead at 1kHz)
+                    # This gives us 100Hz state updates which is still very frequent
+                    if iteration_count % 10 == 0:
+                        self._update_robot_state()
 
                     iteration_count += 1
                     
-                    # Sleep for precise timing to maintain 100Hz
-                    elapsed = time.time() - loop_start
-                    sleep_time = max(0, control_period - elapsed)
+                    # Precise timing control for 1000Hz using absolute timing
+                    next_iteration_time += control_period
+                    current_time = time.time()
+                    sleep_time = next_iteration_time - current_time
+                    
                     if sleep_time > 0:
-                        time.sleep(sleep_time)
+                        # For very short sleep times, use busy waiting for better precision
+                        if sleep_time < 0.0005:  # Less than 0.5ms, use busy wait
+                            while time.time() < next_iteration_time:
+                                pass  # Busy wait for precise timing
+                        else:
+                            time.sleep(sleep_time)
+                    else:
+                        # If we're running behind, reset the timing to prevent drift
+                        next_iteration_time = time.time()
 
                 except Exception as e:
                     print(f"❌ Error in control loop iteration: {e}")
