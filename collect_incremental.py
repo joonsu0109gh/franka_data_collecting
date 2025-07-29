@@ -33,13 +33,24 @@ class DataCollectionController:
         print(f"Robot IP: {self.robot_ip}")
         print(f"Data directory: {self.data_log_root}")
         print(f"Loop rate: {self.loop_rate_hz} Hz")
+        print(f"Translation scale: {translation_scale or config.TRANSLATION_SCALE}")
+        print(f"Rotation scale: {rotation_scale or config.ROTATION_SCALE}")
+        print(f"SpaceMouse deadzone: {config.SPACEMOUSE_DEADZONE}")
+        print(f"Gripper open width: {config.GRIPPER_OPEN_WIDTH}m")
+        print(f"Gripper closed width: {config.GRIPPER_CLOSED_WIDTH}m")
+        print(f"Gripper debounce: {config.GRIPPER_TOGGLE_DEBOUNCE}s")
+        print(f"Max translation delta: {config.MAX_TRANSLATION_DELTA}m")
+        print(f"Max rotation delta: {config.MAX_ROTATION_DELTA} rad")
 
-        # Initialize components
+        # Initialize components with config parameters
         self.robot = RobotInterface(robot_ip=self.robot_ip)
         self.mouse = SpaceMouseManager()
         self.policy = TeleopPolicy(
             translation_scale=translation_scale or config.TRANSLATION_SCALE,
-            rotation_scale=rotation_scale or config.ROTATION_SCALE
+            rotation_scale=rotation_scale or config.ROTATION_SCALE,
+            spacemouse_deadzone=config.SPACEMOUSE_DEADZONE,
+            max_translation_delta=config.MAX_TRANSLATION_DELTA,
+            max_rotation_delta=config.MAX_ROTATION_DELTA
         )
         self.recorder = IncrementalDataRecorder(self.data_log_root)
 

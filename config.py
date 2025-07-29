@@ -9,7 +9,7 @@ ROBOT_IP = "172.16.0.2"  # IP address of the Franka robot
 # Control Parameters
 TRANSLATION_SCALE = 1.0    # Direct spacemouse values (like working example)
 ROTATION_SCALE = 1.0       # Direct spacemouse values (like working example)
-LOOP_RATE_HZ = 10          # Control loop frequency
+LOOP_RATE_HZ = 100          # Control loop frequency
 
 # Data Storage
 DATA_ROOT_DIR = "./my_robot_data"  # Where to save collected data

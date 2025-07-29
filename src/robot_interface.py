@@ -1,4 +1,5 @@
 import numpy as np
+import config
 import threading
 import time
 from typing import Dict, Any
@@ -126,7 +127,7 @@ class RealTimeRobotInterface:
             examples=robot_state,
             get_max_k=32,
             get_time_budget=0.1,
-            put_desired_frequency=15
+            put_desired_frequency=20
         )
 
         # Control threading
@@ -146,6 +147,7 @@ class RealTimeRobotInterface:
         self._gripper_lock = threading.Lock()
         # Track previous button states for edge detection
         self._last_button_state = [False, False]
+        self._last_gripper_command_time = 0.0  # For debouncing gripper commands
 
         # Real-time control variables
         self.current_translation = None
@@ -195,7 +197,7 @@ class RealTimeRobotInterface:
 
             # Initialize gripper
             try:
-                self.robot.gripper.move(width=0.09, speed=0.1)
+                self.robot.gripper.move(width=config.GRIPPER_OPEN_WIDTH, speed=0.1)
                 print("✅ Gripper initialized")
             except Exception as e:
                 print(f"Gripper initialization issue: {e}")
@@ -300,10 +302,10 @@ class RealTimeRobotInterface:
                         self._gripper_command = None
 
                 if command == "open":
-                    self.robot.gripper.move(width=0.08, speed=0.05)
+                    self.robot.gripper.move(width=config.GRIPPER_OPEN_WIDTH, speed=0.05)
                 elif command == "close":
                     self.robot.gripper.grasp(
-                        width=0.01, speed=0.05, force=20
+                        width=config.GRIPPER_CLOSED_WIDTH, speed=0.05, force=20
                     )
 
             except Exception:
@@ -341,18 +343,27 @@ class RealTimeRobotInterface:
             self._delta_rotation = np.array(rotation_delta, dtype=np.float32)
 
     def set_gripper_button_state(self, button_0_pressed, button_1_pressed):
-        """Handle gripper control via button PRESS events (not continuous states)."""
+        """Handle gripper control via button PRESS events with debouncing."""
+        current_time = time.time()
         current_button_state = [button_0_pressed, button_1_pressed]
+
+        # Check if enough time has passed since last gripper command (debouncing)
+        if current_time - self._last_gripper_command_time < config.GRIPPER_TOGGLE_DEBOUNCE:
+            # Update button state but don't send command
+            self._last_button_state = current_button_state
+            return
 
         # Only trigger on button press (rising edge), not continuous press
         # Left button just pressed
         if button_0_pressed and not self._last_button_state[0]:
             with self._gripper_lock:
                 self._gripper_command = "close"
+            self._last_gripper_command_time = current_time
         # Right button just pressed
         elif button_1_pressed and not self._last_button_state[1]:
             with self._gripper_lock:
                 self._gripper_command = "open"
+            self._last_gripper_command_time = current_time
 
         # Update last button state for next comparison
         self._last_button_state = current_button_state
@@ -412,12 +423,12 @@ class RealTimeRobotInterface:
         # The gripper will only respond to button press events via set_gripper_button_state()
 
     def open_gripper(self):
-        """Open the robot gripper."""
+        """Open the robot gripper using config value."""
         with self._gripper_lock:
             self._gripper_command = "open"
 
     def close_gripper(self):
-        """Close the robot gripper."""
+        """Close the robot gripper using config value."""
         with self._gripper_lock:
             self._gripper_command = "close"
 
