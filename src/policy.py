@@ -42,17 +42,15 @@ class TeleopPolicy:
         # Apply safety limits
         delta_translation = np.clip(raw_translation, -self.max_translation_delta, self.max_translation_delta)
 
-        # 2. Calculate Rotation Delta with deadzone and safety limits (disabled like reference robot.py)
-        # Reference code sets drot_xyz[:] = 0, so we disable rotation for now
+        # 2. Calculate Rotation Delta with deadzone and safety limits
         raw_rotation = np.array([
             apply_deadzone(mouse_state.roll, self.spacemouse_deadzone),
             apply_deadzone(-mouse_state.pitch, self.spacemouse_deadzone),
             apply_deadzone(-mouse_state.yaw, self.spacemouse_deadzone)
         ]) * self.rotation_scale * np.pi / 180.0  # Convert to radians
         
-        # Apply safety limits and disable for now (like reference)
-        delta_rotation = np.zeros(3)  # Disabled like reference
-        # delta_rotation = np.clip(raw_rotation, -self.max_rotation_delta, self.max_rotation_delta)
+        # Apply safety limits for rotation
+        delta_rotation = np.clip(raw_rotation, -self.max_rotation_delta, self.max_rotation_delta)
 
         # 3. Handle Gripper State using config values
         gripper_width = config.GRIPPER_CLOSED_WIDTH  # Default closed
@@ -77,14 +75,13 @@ class TeleopPolicy:
             'gripper_width': gripper_width,
             'delta_translation': delta_translation,  # For real-time control
             'delta_rotation': delta_rotation,  # For real-time control
-            'velocity_cmd': {  # For franky velocity control
+            'velocity_cmd': {  # For franky velocity control (not used anymore)
                 "x": float(delta_translation[0] * 10),  # Scale up for velocity
                 "y": float(delta_translation[1] * 10),
                 "z": float(delta_translation[2] * 10),
                 "R": float(delta_rotation[0] * 2),
                 "P": float(delta_rotation[1] * 2),
                 "Y": float(delta_rotation[2] * 2),
-                "duration": 100,  # 100ms duration
-                "is_async": True,
+                "is_async": True,  # No duration - continuous velocity control
             }
         }

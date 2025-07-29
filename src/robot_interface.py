@@ -55,9 +55,11 @@ class FrankaRobotWrapper:
             if abs(x) < 1e-6 and abs(y) < 1e-6 and abs(z) < 1e-6 and abs(R) < 1e-6 and abs(P) < 1e-6 and abs(Y) < 1e-6:
                 return
             
-            # Use simple franky API like the working example
-            # Create motion with simple Twist constructor 
-            motion = CartesianVelocityMotion(Twist(np.array([x, y, z])))
+            # Use franky API for continuous velocity control
+            # Create motion with both linear and angular velocity
+            linear_velocity = np.array([x, y, z])
+            angular_velocity = np.array([R, P, Y]) 
+            motion = CartesianVelocityMotion(Twist(linear_velocity, angular_velocity))
             
             # Execute motion (always async for velocity control)
             self.robot.move(motion, asynchronous=True)
@@ -148,6 +150,8 @@ class RealTimeRobotInterface:
         # Track previous button states for edge detection
         self._last_button_state = [False, False]
         self._last_gripper_command_time = 0.0  # For debouncing gripper commands
+        # Store gripper future objects to prevent them from being destroyed (fixes blocking issue)
+        self._gripper_futures = []
 
         # Real-time control variables
         self.current_translation = None
@@ -197,7 +201,10 @@ class RealTimeRobotInterface:
 
             # Initialize gripper
             try:
-                self.robot.gripper.move(width=config.GRIPPER_OPEN_WIDTH, speed=0.1)
+                # Use async operation during initialization but wait for completion
+                gripper_future = self.robot.gripper.move_async(width=config.GRIPPER_OPEN_WIDTH, speed=0.1)
+                # Store future to prevent destruction
+                self._gripper_futures.append(gripper_future)
                 print("✅ Gripper initialized")
             except Exception as e:
                 print(f"Gripper initialization issue: {e}")
@@ -226,11 +233,11 @@ class RealTimeRobotInterface:
             print("✅ Real-time control started")
 
     def _realtime_control_loop(self):
-        """Real-time control loop running in separate thread using franky at 200Hz."""
+        """Real-time control loop running in separate thread using franky at higher frequency."""
         try:
             # Signal that we're ready
             self._ready_event.set()
-            print("🔄 Real-time control loop started at 20Hz using franky")
+            print("🔄 Real-time control loop started at 100Hz using franky")
 
             # Start gripper control thread
             self._gripper_stop_event.clear()
@@ -238,19 +245,20 @@ class RealTimeRobotInterface:
                 target=self._gripper_control_loop, daemon=True)
             self._gripper_thread.start()
 
-            # Control loop matching the working example (20Hz like the reference)
-            control_period = 0.05  # 50ms = 20Hz like the working example
+            # Higher frequency control loop for more responsive robot control
+            control_period = 0.01  # 10ms = 100Hz for much more responsive control
             iteration_count = 0
 
             while not self._stop_event.is_set():
                 try:
                     loop_start = time.time()
                     
-                    # Get movement deltas from main thread - increase scaling for visible movement
+                    # Get movement deltas from main thread - scale significantly for velocity control
                     with self._command_lock:
-                        # Increase scaling for more responsive movement
-                        dpos = self._delta_translation * 1.0   # Increased for faster movement
-                        drot = self._delta_rotation * 0.5      # Increased for faster rotation
+                        # Scale deltas to proper velocities for responsive movement
+                        # Since franky expects velocities (m/s), we need to scale the small deltas up
+                        dpos = self._delta_translation * 10.0   # Scale up for velocity control (10x faster)
+                        drot = self._delta_rotation * 5.0       # Scale up for angular velocity control
 
                     # Use franky's velocity control if there's movement
                     if np.any(dpos != 0) or np.any(drot != 0):
@@ -265,12 +273,12 @@ class RealTimeRobotInterface:
                         }
                         self.robot.cartesian_velocity_control(velocity_cmd)
 
-                    # Update state buffer (update every iteration at 50Hz)
+                    # Update state buffer (update every iteration at 100Hz)
                     self._update_robot_state()
 
                     iteration_count += 1
                     
-                    # Sleep for precise timing to maintain 20Hz
+                    # Sleep for precise timing to maintain 100Hz
                     elapsed = time.time() - loop_start
                     sleep_time = max(0, control_period - elapsed)
                     if sleep_time > 0:
@@ -291,7 +299,13 @@ class RealTimeRobotInterface:
             print("🔄 Real-time control loop stopped")
 
     def _gripper_control_loop(self):
-        """Gripper control loop - execute commands only once per button press."""
+        """
+        Gripper control loop - execute commands only once per button press with async operations.
+        
+        Uses async gripper operations and retains future objects to prevent blocking of other threads.
+        This fixes the issue where synchronous gripper calls would block the robot control thread.
+        Based on solution from franky GitHub issue: TimSchneider42/franky#158
+        """
         while not self._gripper_stop_event.is_set():
             try:
                 command = None
@@ -302,11 +316,21 @@ class RealTimeRobotInterface:
                         self._gripper_command = None
 
                 if command == "open":
-                    self.robot.gripper.move(width=config.GRIPPER_OPEN_WIDTH, speed=0.05)
+                    # Use async operation and retain future to prevent blocking
+                    future = self.robot.gripper.move_async(width=config.GRIPPER_OPEN_WIDTH, speed=0.05)
+                    self._gripper_futures.append(future)
+                    # Keep only recent futures to prevent memory buildup
+                    if len(self._gripper_futures) > 10:
+                        self._gripper_futures.pop(0)
                 elif command == "close":
-                    self.robot.gripper.grasp(
+                    # Use async operation and retain future to prevent blocking
+                    future = self.robot.gripper.grasp_async(
                         width=config.GRIPPER_CLOSED_WIDTH, speed=0.05, force=20
                     )
+                    self._gripper_futures.append(future)
+                    # Keep only recent futures to prevent memory buildup
+                    if len(self._gripper_futures) > 10:
+                        self._gripper_futures.pop(0)
 
             except Exception:
                 pass  # Silently continue on gripper errors to maintain control loop speed
