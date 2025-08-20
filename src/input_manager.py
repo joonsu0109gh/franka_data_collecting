@@ -61,7 +61,7 @@ def spacemouse_process(shm_name: str, stop_event):
                 time.sleep(0.01)
 
     except Exception as e:
-        print(f"SpaceMouse Error: {e}")
+        raise RuntimeError(f"SpaceMouse Error: {e}")
     finally:
         try:
             pyspacemouse.close()
@@ -86,6 +86,7 @@ class SpaceMouseManager:
                            np.dtype(COMMAND_DTYPE).itemsize)
         self.input_shm = shared_memory.SharedMemory(
             create=True, size=command_size)
+        
         self.latest_command_view = np.ndarray(
             COMMAND_SHAPE, dtype=COMMAND_DTYPE, buffer=self.input_shm.buf
         )

@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 import cv2
 from scipy.spatial.transform import Rotation as R
+import pyrealsense2 as rs
 
 
 class IncrementalDataRecorder:
@@ -51,8 +52,6 @@ class IncrementalDataRecorder:
         If serials not provided, will use first two available cameras.
         """
         try:
-            import pyrealsense2 as rs
-
             # Get connected devices
             ctx = rs.context()
             devices = ctx.query_devices()
@@ -200,12 +199,14 @@ class IncrementalDataRecorder:
 
         return np.concatenate([position, euler_angles])
 
-    def gripper_width_to_binary(self, gripper_width: float, threshold: float = 0.01) -> float:
+    def gripper_width_to_binary(self, gripper_width: float, threshold: float = 0.05) -> float:
         """Convert gripper width to binary state."""
-        return 1.0 if gripper_width > threshold else -1.0
+        return 1.0 if gripper_width < threshold else 0.0
 
     def record_timestep_with_images(self, observation: Dict[str, Any], action: Dict[str, Any],
-                                    language_instruction: str, img_primary: np.ndarray, img_wrist: np.ndarray):
+                                    language_instruction: str, 
+                                    img_primary: np.ndarray, img_wrist: np.ndarray,
+                                    depth_primary: np.ndarray, depth_wrist: np.ndarray):
         """
         Record a single timestep with pre-captured images (for shared memory cameras).
         This version is optimized for non-blocking operation.
@@ -223,45 +224,34 @@ class IncrementalDataRecorder:
             # 1. Save images (already captured from shared memory)
             primary_path = timestep_dir / "image_primary.jpg"
             wrist_path = timestep_dir / "image_wrist.jpg"
+            primary_depth_path = timestep_dir / "depth_primary.npy"
+            wrist_depth_path = timestep_dir / "depth_wrist.npy"
+
 
             cv2.imwrite(str(primary_path), img_primary)
             cv2.imwrite(str(wrist_path), img_wrist)
 
+            np.save(primary_depth_path, depth_primary)
+            np.save(wrist_depth_path, depth_wrist)
+            
             # 2. Process robot state
             pose_6d = self.pose_matrix_to_6d(observation['panda_hand_pose'])
-            gripper_binary = self.gripper_width_to_binary(
-                observation['panda_gripper_width'])
 
-            # 3. Process action deltas
-            action_deltas = action.get('delta_translation', [
-                                       0, 0, 0]) + action.get('delta_rotation', [0, 0, 0])
+            gripper_width = observation['panda_gripper_width']
 
             # 4. Create data structure
             data = {
                 'observation': {
                     'joint_positions': observation['panda_joint_positions'].astype(np.float32),
                     'ee_pose_6d': pose_6d.astype(np.float32),
-                    'gripper_state': np.array([gripper_binary], dtype=np.float32)
+                    'gripper_state': np.array([gripper_width], dtype=np.float32)
                 },
-                'action': {
-                    'ee_delta_pose_6d': np.array(action_deltas, dtype=np.float32),
-                    # Use same as state for now
-                    'gripper_action': np.array([gripper_binary], dtype=np.float32)
-                },
-                'language_instruction': language_instruction
+                'task':{
+                    'language_instruction': language_instruction
+                }
             }
 
-            # 5. Save data
-            data_path = timestep_dir / "other.npz"
-            np.savez_compressed(data_path, **{
-                key: value for key, value in data.items()
-                if key != 'language_instruction'
-            })
-
-            # 6. Save language instruction separately
-            lang_path = timestep_dir / "language_instruction.txt"
-            with open(lang_path, 'w') as f:
-                f.write(language_instruction)
+            np.save(f"{timestep_dir}/other.npy", data)
 
             self.current_timestep += 1
 
