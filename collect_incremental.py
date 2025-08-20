@@ -3,14 +3,11 @@ import config
 import numpy as np
 from multiprocessing import Process, shared_memory, Event
 
-# Import our modular classes
-from src.input_manager import SpaceMouseManager
-from src.policy import TeleopPolicy
 from src.incremental_recorder import IncrementalDataRecorder
 from src.robot_interface import RobotInterface
 from src.utils import Rate
 from src.camera_reader import camera_process_realsense, dummy_camera_process
-
+import threading
 
 class DataCollectionController:
     """Orchestrates the entire data collection process with incremental saving."""
@@ -18,49 +15,46 @@ class DataCollectionController:
     def __init__(self,
                  data_log_root=None,
                  robot_ip=None,
-                 translation_scale=None,
-                 rotation_scale=None,
                  loop_rate_hz=None,
+                 robot_loop_rate_hz=None,
                  primary_camera_serial=None,
-                 wrist_camera_serial=None):
+                 wrist_camera_serial=None,
+                 home_pose=None,
+                 gripper_open_width=None,
+                 gripper_closed_width=None):
 
         # Use config file values as defaults
-        self.data_log_root = data_log_root or config.DATA_ROOT_DIR
-        self.robot_ip = robot_ip or config.ROBOT_IP
-        self.loop_rate_hz = loop_rate_hz or config.LOOP_RATE_HZ
+        self.data_log_root = data_log_root
+        self.robot_ip = robot_ip
+        self.loop_rate_hz = loop_rate_hz
+        self.home_pose = home_pose
+        self.robot_loop_rate_hz = robot_loop_rate_hz
+        self.gripper_open_width = gripper_open_width
+        self.gripper_closed_width = gripper_closed_width
 
-        print("Initializing controller...")
-        print(f"Robot IP: {self.robot_ip}")
-        print(f"Data directory: {self.data_log_root}")
-        print(f"Loop rate: {self.loop_rate_hz} Hz")
-        print(f"Translation scale: {translation_scale or config.TRANSLATION_SCALE}")
-        print(f"Rotation scale: {rotation_scale or config.ROTATION_SCALE}")
-        print(f"SpaceMouse deadzone: {config.SPACEMOUSE_DEADZONE}")
-        print(f"Gripper open width: {config.GRIPPER_OPEN_WIDTH}m")
-        print(f"Gripper closed width: {config.GRIPPER_CLOSED_WIDTH}m")
-        print(f"Gripper debounce: {config.GRIPPER_TOGGLE_DEBOUNCE}s")
-        print(f"Max translation delta: {config.MAX_TRANSLATION_DELTA}m")
-        print(f"Max rotation delta: {config.MAX_ROTATION_DELTA} rad")
+        self.first_record_flg = True
+        self.is_collecting_flg = False  # Flag to control camera processes
 
         # Initialize components with config parameters
-        self.robot = RobotInterface(robot_ip=self.robot_ip)
-        self.mouse = SpaceMouseManager()
-        self.policy = TeleopPolicy(
-            translation_scale=translation_scale or config.TRANSLATION_SCALE,
-            rotation_scale=rotation_scale or config.ROTATION_SCALE,
-            spacemouse_deadzone=config.SPACEMOUSE_DEADZONE,
-            max_translation_delta=config.MAX_TRANSLATION_DELTA,
-            max_rotation_delta=config.MAX_ROTATION_DELTA
-        )
+        self.robot = RobotInterface(robot_ip=self.robot_ip, home_pose=self.home_pose, 
+                                    robot_loop_rate_hz=self.robot_loop_rate_hz,
+                                    gripper_open_width=self.gripper_open_width,
+                                    gripper_closed_width=self.gripper_closed_width)
+
         self.recorder = IncrementalDataRecorder(self.data_log_root)
 
         # Initialize precise rate limiter for stable control loop
         self.rate_limiter = Rate(self.loop_rate_hz)
 
         # Initialize cameras with shared memory for fast access
-        print("Initializing shared memory cameras...")
+        print("------Initializing shared memory cameras...------")
+        print(f"⏳ Camera initialization delay set: {config.CAMERA_INITIALIZATION_DELAY} seconds.")
+
         camera_success = self._initialize_shared_memory_cameras(
             primary_camera_serial, wrist_camera_serial)
+        
+        # Give cameras time to initialize
+        time.sleep(config.CAMERA_INITIALIZATION_DELAY)
         if not camera_success:
             print("⚠️ Cameras failed to initialize, continuing without cameras")
 
@@ -76,16 +70,32 @@ class DataCollectionController:
                 create=True, size=frame_size)
             self.shm_wrist = shared_memory.SharedMemory(
                 create=True, size=frame_size)
+            
+            self.depth_shape = (480, 640)  # Depth images are single channel
+            self.depth_dtype = np.uint16  
+            depth_frame_size = int(np.prod(self.depth_shape) *
+                                   np.dtype(self.depth_dtype).itemsize)  # Same dtype for depth
+
+            self.shm_primary_depth = shared_memory.SharedMemory(
+                create=True, size=depth_frame_size)   
+            self.shm_wrist_depth = shared_memory.SharedMemory(
+                create=True, size=depth_frame_size)
 
             # Create NumPy array views for easy access
             self.latest_frame_primary = np.ndarray(
                 self.cam_shape, dtype=self.cam_dtype, buffer=self.shm_primary.buf)
             self.latest_frame_wrist = np.ndarray(
                 self.cam_shape, dtype=self.cam_dtype, buffer=self.shm_wrist.buf)
+            self.latest_frame_primary_depth = np.ndarray(
+                self.depth_shape, dtype=self.depth_dtype, buffer=self.shm_primary_depth.buf)
+            self.latest_frame_wrist_depth = np.ndarray(
+                self.depth_shape, dtype=self.depth_dtype, buffer=self.shm_wrist_depth.buf)
 
             # Initialize with black frames
             self.latest_frame_primary.fill(0)
             self.latest_frame_wrist.fill(0)
+            self.latest_frame_primary_depth.fill(0)
+            self.latest_frame_wrist_depth.fill(0)
 
             # Start camera process
             self.camera_stop_event = Event()
@@ -94,23 +104,20 @@ class DataCollectionController:
             try:
                 self.camera_process = Process(
                     target=camera_process_realsense,
-                    args=(self.shm_primary.name, self.shm_wrist.name,
-                          self.cam_shape, self.cam_dtype, self.camera_stop_event,
+                    args=(self.shm_primary.name, self.shm_wrist.name, self.shm_primary_depth.name, self.shm_wrist_depth.name,
+                          self.cam_shape, self.cam_dtype, self.depth_shape, self.depth_dtype, self.camera_stop_event, self.is_collecting_flg,
                           primary_serial, wrist_serial)
                 )
                 print("📸 Starting RealSense camera processes...")
             except Exception:
                 self.camera_process = Process(
                     target=dummy_camera_process,
-                    args=(self.shm_primary.name, self.shm_wrist.name,
+                    args=(self.shm_primary.name, self.shm_wrist.name, self.shm_primary_depth.name, self.shm_wrist_depth.name,
                           self.cam_shape, self.cam_dtype, self.camera_stop_event)
                 )
                 print("📸 Starting dummy camera processes...")
 
             self.camera_process.start()
-
-            # Give cameras time to initialize
-            time.sleep(2.0)
 
             return True
 
@@ -124,12 +131,14 @@ class DataCollectionController:
             # Copy to avoid race conditions (this is very fast)
             img_primary = self.latest_frame_primary.copy()
             img_wrist = self.latest_frame_wrist.copy()
-            return img_primary, img_wrist
+            depth_primary = self.latest_frame_primary_depth.copy()
+            depth_wrist = self.latest_frame_wrist_depth.copy()
+            return img_primary, img_wrist, depth_primary, depth_wrist
         except Exception as e:
             print(f"❌ Error getting camera images: {e}")
             # Return dummy images if something goes wrong
             dummy_img = np.zeros(self.cam_shape, dtype=self.cam_dtype)
-            return dummy_img, dummy_img
+            return dummy_img, dummy_img, dummy_img, dummy_img
 
     def collect_episode(self, language_instruction: str, episode_num: int, total_episodes: int):
         """Collect a single episode of demonstration data."""
@@ -145,11 +154,18 @@ class DataCollectionController:
         # Start new episode
         episode_dir = self.recorder.start_new_episode(language_instruction)
 
-        print("Controls:")
-        print("  • Move SpaceMouse: Control robot position")
-        print("  • Left button (first): Close gripper")
-        print("  • Right button (last): Open gripper")
-        print("  • Hold BOTH buttons for 3 seconds: End episode and continue to next")
+        print("Controls:") 
+        if self.robot.controller_type == "spacemouse":
+            print("  • Move SpaceMouse: Control robot position")
+            print("  • Left button (first): Close gripper")
+            print("  • Right button (last): Open gripper")
+            print("  • Hold BOTH buttons for 3 seconds: End episode and continue to next")
+        elif self.robot.controller_type == "xbox":
+            print("  • Left Joystick: Control robot position")
+            print("  • Right Joystick: Control robot orientation")
+            print("  • A button: Close gripper")
+            print("  • B button: Open gripper")
+            print("  • Hold BOTH A and B buttons for 3 seconds: End episode and continue to next")
         print("="*60 + "\n")
 
         step_count = 0
@@ -158,17 +174,17 @@ class DataCollectionController:
 
         # Reset the rate limiter for this episode
         self.rate_limiter.reset()
-
+        self.is_collecting_flg = True  # Set flag to indicate we are collecting data
         try:
             while True:
-
                 # 1. Get current robot state (Observation) - minimize latency
                 current_obs = self.robot.get_obs()
                 current_ee_pose = current_obs['panda_hand_pose']
 
                 # 2. Get user input
-                mouse_state = self.mouse.get_state()
-                if mouse_state is None:
+                controller_state = self.robot.controller.get_state()
+
+                if controller_state is None:
                     time.sleep(0.1)  # Small sleep if no mouse data
                     continue
 
@@ -176,21 +192,30 @@ class DataCollectionController:
                 button_left = False
                 button_right = False
 
-                if hasattr(mouse_state, 'buttons') and mouse_state.buttons:
-                    if len(mouse_state.buttons) >= 15:
-                        # SpaceMouse Pro/Enterprise with 15 buttons
-                        # First button (left)
-                        button_left = mouse_state.buttons[0]
-                        # Last button (right)
-                        button_right = mouse_state.buttons[14]
-                    elif len(mouse_state.buttons) >= 2:
-                        # Standard SpaceMouse with 2 buttons
-                        button_left = mouse_state.buttons[0]
-                        button_right = mouse_state.buttons[1]
-                    elif len(mouse_state.buttons) == 1:
-                        # Some SpaceMouse models only report one button
-                        button_left = mouse_state.buttons[0]
-                        # Remove print to avoid slowing down control loop
+                if hasattr(controller_state, 'buttons') and controller_state.buttons:
+                    if self.robot.controller_type == "spacemouse":
+                        if len(controller_state.buttons) >= 15:
+                            # SpaceMouse Pro/Enterprise with 15 buttons
+                            # First button (left)
+                            button_left = controller_state.buttons[0]
+                            # Last button (right)
+                            button_right = controller_state.buttons[14]
+                        elif len(controller_state.buttons) >= 2:
+                            # Standard SpaceMouse with 2 buttons
+                            button_left = controller_state.buttons[0]
+                            button_right = controller_state.buttons[1]
+                        elif len(controller_state.buttons) == 1:
+                            # Some SpaceMouse models only report one button
+                            button_left = controller_state.buttons[0]
+                            # Remove print to avoid slowing down control loop
+                    elif self.robot.controller_type == "xbox":
+                        # Xbox controller buttons are already handled in the state
+                        button_left = controller_state.buttons[0]
+                        button_right = controller_state.buttons[1]
+                else:
+                    print("⚠️ No button state available, using defaults")
+                    button_left = False
+                    button_right = False
 
                 # Check for both buttons held for episode end
                 if button_left and button_right:  # Both buttons pressed
@@ -201,19 +226,18 @@ class DataCollectionController:
                         print(
                             "🗑️ Skipping data recording during episode transition...")
                     elif time.time() - both_buttons_start_time >= 3.0:
-                        recorded_timesteps = step_count // 50  # Actual recorded data points
+                        recorded_timesteps = step_count # Actual recorded data points
                         print(
                             f"\n🛑 Episode {episode_num} ended by user. Recorded {recorded_timesteps} timesteps ({step_count} control steps).")
+                        self.is_collecting_flg = False  # Stop collecting data
                         break
                 else:
                     both_buttons_start_time = None  # Reset if buttons released
                     episode_ending = False  # Resume recording if buttons released
 
                 # 3. Get the desired action from the policy
-                action = self.policy.get_action(mouse_state, current_ee_pose)
+                action = self.robot.policy.get_action(controller_state, current_ee_pose)
 
-                # 4. Execute the action on the robot (real-time)
-                self.robot.step(action)
 
                 # 5. Send direct button states for gripper control (only if not ending episode)
                 if not (button_left and button_right):
@@ -223,17 +247,19 @@ class DataCollectionController:
                 # 6. Record the timestep (much less frequently to maintain 10Hz control)
                 # Record every 50th iteration to get ~0.2Hz recording rate at 10Hz control
                 # This ensures control loop stays fast while still capturing essential data
-                if not episode_ending and step_count % 50 == 0:
+                if not episode_ending:
                     try:
+                        if self.first_record_flg:
+                            print("📁 Starting new episode recording...")
+                            self.first_record_flg = False
                         # Get camera images from shared memory (fast, non-blocking)
-                        img_primary, img_wrist = self.get_camera_images()
+                        img_primary, img_wrist, depth_primary, depth_wrist = self.get_camera_images()
 
                         # Use threading to make recording non-blocking
-                        import threading
                         recording_thread = threading.Thread(
                             target=self.recorder.record_timestep_with_images,
                             args=(current_obs, action,
-                                  language_instruction, img_primary, img_wrist),
+                                  language_instruction, img_primary, img_wrist, depth_primary, depth_wrist),
                             daemon=True
                         )
                         recording_thread.start()
@@ -243,10 +269,10 @@ class DataCollectionController:
                 step_count += 1  # Always increment step count
 
                 # Monitor control loop performance less frequently to reduce overhead
-                # Check every 200 steps (~20 seconds at 10Hz) to reduce console spam
-                if step_count % 200 == 0 and step_count > 0:
+                # Check every 50 steps (~5 seconds at 10Hz) to reduce console spam
+                if step_count % 50 == 0 and step_count > 0:
                     actual_hz = self.rate_limiter.get_actual_rate()
-                    recorded_timesteps = step_count // 50  # Actual recorded data points
+                    recorded_timesteps = step_count
 
                     # Check if rate is within bounds (9.7-10.3Hz)
                     if not self.rate_limiter.is_rate_stable():
@@ -256,7 +282,6 @@ class DataCollectionController:
                         elif actual_hz < 9.7:
                             print(
                                 f"⚠️ Rate too low: {actual_hz:.2f}Hz < 9.7Hz")
-
                     print(
                         f"📊 Episode {episode_num}: {recorded_timesteps} recorded timesteps ({step_count} control steps) | Control loop: {actual_hz:.2f}Hz")
 
@@ -264,14 +289,17 @@ class DataCollectionController:
                 self.rate_limiter.sleep()
 
         except KeyboardInterrupt:
-            recorded_timesteps = step_count // 50  # Actual recorded data points
+            recorded_timesteps = step_count  # Actual recorded data points
             print(
                 f"\n🛑 Episode {episode_num} interrupted by Ctrl+C. Recorded {recorded_timesteps} timesteps ({step_count} control steps).")
 
         print(f"📁 Saved to: {episode_dir}")
         # Clear any residual control signals after episode
         self._clear_control_signals()
-        recorded_timesteps = step_count // 50  # Return actual recorded timesteps
+        recorded_timesteps = step_count  # Return actual recorded timesteps
+
+        # Clear robot motion deltas to ensure no residual commands
+
         return recorded_timesteps
 
     def _reset_for_new_episode(self):
@@ -286,12 +314,13 @@ class DataCollectionController:
         # For subsequent episodes, robot position reset is handled in the inter-episode wait
         print("🏠 Preparing for new episode...")
 
-        # Restart SpaceMouse process if it died during Ctrl+C
-        if not self.mouse.is_alive():
-            print("🔄 Restarting SpaceMouse process...")
-            self.mouse.stop()
+
+        # Restart controller process if it died during Ctrl+C
+        if not self.robot.controller.is_alive():
+            print("🔄 Restarting controller process...")
+            self.robot.controller.stop()
             time.sleep(0.5)
-            self.mouse.start()
+            self.robot.controller.start()
 
         # Clear all movement deltas (real-time safe)
         self.robot.set_movement_delta([0, 0, 0], [0, 0, 0])
@@ -306,31 +335,23 @@ class DataCollectionController:
 
     def _clear_control_signals(self):
         """Clear all control signals and movement commands."""
-        # Clear spacemouse input buffer
-        if self.mouse:
-            # Read and discard any pending spacemouse data
-            for _ in range(10):
-                self.mouse.get_state()
-
         # Clear robot movement deltas
         if self.robot:
             self.robot.set_movement_delta([0, 0, 0], [0, 0, 0])
-
         print("🧹 Control signals cleared")
 
     def run(self):
-        """Main data collection loop with multiple episodes."""
-        print("Starting SpaceMouse input process...")
-        self.mouse.start()
+        
 
         # Reset robot to a neutral position and open gripper
-        print("Resetting robot to initial pose...")
+        print("------Resetting robot to initial pose...------")
+
         # This is OK during initial setup before real-time control starts
         self.robot.reset_joints()
         self.robot.open_gripper()
 
         # Start real-time control loop
-        print("Starting real-time control loop...")
+        print("------Starting real-time control loop...------")
         self.robot.start_realtime_control()
 
         try:
@@ -339,12 +360,13 @@ class DataCollectionController:
             print("🤖 MULTI-EPISODE DATA COLLECTION SETUP")
             print("="*60)
 
-            language_instruction = input(
-                "📝 Enter language instruction for demonstrations: ")
-            while not language_instruction.strip():
-                language_instruction = input(
-                    "📝 Please enter a valid instruction: ")
-
+            # language_instruction = input(
+            #     "📝 Enter language instruction for demonstrations: ")
+            # while not language_instruction.strip():
+            #     language_instruction = input(
+            #         "📝 Please enter a valid instruction: ")
+            language_instruction = config.LANGUAGE_INSTRUCTION
+            print(f"📜 Using instruction: '{language_instruction}'")
             num_episodes = input("🔢 Enter number of episodes to collect: ")
             while True:
                 try:
@@ -372,12 +394,18 @@ class DataCollectionController:
                     # Actually move robot to initial position using safe reset
                     try:
                         self.robot.safe_episode_reset()
+                        self.robot.open_gripper()
                         print("✅ Robot moved to initial position")
                     except Exception as e:
                         print(f"⚠️ Could not reset robot position: {e}")
                         # Fallback to simple movement clearing
                         self.robot.set_movement_delta([0, 0, 0], [0, 0, 0])
                         self.robot.open_gripper()
+
+                    # self.robot._initialize_robot()
+                    # self.robot.start_realtime_control()
+
+
 
                     for i in range(10, 0, -1):
                         print(f"   Starting in {i} seconds...", end="\r")
@@ -396,7 +424,7 @@ class DataCollectionController:
             print("\n🎉 ALL EPISODES COMPLETED!")
             print(f"📊 Total timesteps collected: {total_timesteps}")
             print(
-                f"📁 Data saved to experiment directory: {self.recorder.experiment_dir}")
+                f"📁 Data saved to experiment directory: {self.recorder.experiment_dir} 📁")
 
         except KeyboardInterrupt:
             print("\n🛑 Data collection interrupted.")
@@ -404,7 +432,7 @@ class DataCollectionController:
             print(f"\n❌ Error during data collection: {e}")
         finally:
             print("🔄 Shutting down...")
-            self.mouse.stop()
+            self.robot.controller.stop()
             self.recorder.cleanup()
             self._cleanup_cameras()
             self.robot.end()
@@ -415,49 +443,43 @@ class DataCollectionController:
         try:
             if hasattr(self, 'camera_stop_event'):
                 self.camera_stop_event.set()
+
             if hasattr(self, 'camera_process'):
                 self.camera_process.join(timeout=5.0)
-            if hasattr(self, 'shm_primary'):
-                self.shm_primary.close()
-                self.shm_primary.unlink()
-            if hasattr(self, 'shm_wrist'):
-                self.shm_wrist.close()
-                self.shm_wrist.unlink()
+                if self.camera_process.is_alive():
+                    print("⚠️ Camera process still alive. Terminating forcefully...")
+                    self.camera_process.terminate()
+                    self.camera_process.join()
+
+            # Clean up shared memory
+            for shm_attr in ['shm_primary', 'shm_wrist', 'shm_primary_depth', 'shm_wrist_depth']:
+                shm = getattr(self, shm_attr, None)
+                if shm:
+                    try:
+                        shm.close()
+                        shm.unlink()
+                    except Exception as e:
+                        print(f"⚠️ Error cleaning {shm_attr}: {e}")
+
             print("📸 Camera resources cleaned up")
+
         except Exception as e:
             print(f"⚠️ Camera cleanup error: {e}")
 
-
 def main():
-    """Main entry point with command line argument support."""
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description='Collect robot demonstration data with incremental saving')
-    parser.add_argument('--robot-ip', type=str, help='Robot IP address')
-    parser.add_argument('--data-dir', type=str, help='Data storage directory')
-    parser.add_argument('--rate', type=int, help='Control loop rate (Hz)')
-    parser.add_argument('--translation-scale', type=float,
-                        help='Translation sensitivity')
-    parser.add_argument('--rotation-scale', type=float,
-                        help='Rotation sensitivity')
-    parser.add_argument('--primary-camera', type=str,
-                        help='Primary camera serial number')
-    parser.add_argument('--wrist-camera', type=str,
-                        help='Wrist camera serial number')
-
-    args = parser.parse_args()
-
-    controller = DataCollectionController(
-        robot_ip=args.robot_ip,
-        data_log_root=args.data_dir,
-        loop_rate_hz=args.rate,
-        translation_scale=args.translation_scale,
-        rotation_scale=args.rotation_scale,
-        primary_camera_serial=args.primary_camera,
-        wrist_camera_serial=args.wrist_camera
+    # Use config defaults if not provided
+    data_collecter = DataCollectionController(
+        robot_ip=config.ROBOT_IP,
+        data_log_root=config.DATA_ROOT_DIR,
+        loop_rate_hz=config.DATA_LOOP_RATE_HZ,
+        robot_loop_rate_hz=config.ROBOT_LOOP_RATE_HZ,
+        primary_camera_serial=config.CAMERA_PRIMARY_SERIAL,
+        wrist_camera_serial=config.CAMERA_WRIST_SERIAL,
+        home_pose=config.HOME_POSE,
+        gripper_open_width=config.GRIPPER_OPEN_WIDTH,
+        gripper_closed_width=config.GRIPPER_CLOSED_WIDTH
     )
-    controller.run()
+    data_collecter.run()
 
 
 if __name__ == "__main__":

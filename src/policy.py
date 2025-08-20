@@ -10,53 +10,55 @@ class TeleopPolicy:
     """
 
     def __init__(self, translation_scale=None, rotation_scale=None, 
-                 spacemouse_deadzone=None, max_translation_delta=None, max_rotation_delta=None):
-        self.translation_scale = translation_scale or config.TRANSLATION_SCALE
-        self.rotation_scale = rotation_scale or config.ROTATION_SCALE
-        self.spacemouse_deadzone = spacemouse_deadzone or config.SPACEMOUSE_DEADZONE
-        self.max_translation_delta = max_translation_delta or config.MAX_TRANSLATION_DELTA
-        self.max_rotation_delta = max_rotation_delta or config.MAX_ROTATION_DELTA
+                 controller_deadzone=None, max_translation_delta=None, max_rotation_delta=None):
+        self.translation_scale = translation_scale
+        self.rotation_scale = rotation_scale
+        self.controller_deadzone = controller_deadzone
+        self.max_translation_delta = max_translation_delta
+        self.max_rotation_delta = max_rotation_delta
 
-    def get_action(self, mouse_state, current_ee_pose):
+    def apply_deadzone(self, value, deadzone):
+        return value if abs(value) > deadzone else 0.0
+    
+    def get_action(self, controller_state, current_ee_pose):
         """
         Calculates incremental movement commands for real-time control.
 
         Args:
-            mouse_state: The state object from the SpaceMouseManager.
+            controller_state: The state object from the SpaceMouseManager.
             current_ee_pose: The current 4x4 pose matrix of the robot's end-effector.
 
         Returns:
             A dictionary containing incremental movement deltas and gripper command.
         """
         # Apply deadzone to spacemouse input
-        def apply_deadzone(value, deadzone):
-            return value if abs(value) > deadzone else 0.0
-        
+
         # 1. Calculate Translation Delta (incremental movement) with deadzone and safety limits
         raw_translation = np.array([
-            apply_deadzone(mouse_state.x, self.spacemouse_deadzone),
-            apply_deadzone(mouse_state.y, self.spacemouse_deadzone), 
-            apply_deadzone(mouse_state.z, self.spacemouse_deadzone)
+            self.apply_deadzone(controller_state.x, self.controller_deadzone),
+            self.apply_deadzone(controller_state.y, self.controller_deadzone), 
+            self.apply_deadzone(controller_state.z, self.controller_deadzone)
         ]) * self.translation_scale
-        
+
         # Apply safety limits
         delta_translation = np.clip(raw_translation, -self.max_translation_delta, self.max_translation_delta)
 
         # 2. Calculate Rotation Delta with deadzone and safety limits
         raw_rotation = np.array([
-            apply_deadzone(mouse_state.roll, self.spacemouse_deadzone),
-            apply_deadzone(-mouse_state.pitch, self.spacemouse_deadzone),
-            apply_deadzone(-mouse_state.yaw, self.spacemouse_deadzone)
-        ]) * self.rotation_scale * np.pi / 180.0  # Convert to radians
-        
+            self.apply_deadzone(controller_state.roll, self.controller_deadzone),
+            self.apply_deadzone(-controller_state.pitch, self.controller_deadzone),
+            self.apply_deadzone(-controller_state.yaw, self.controller_deadzone)
+        ]) * self.rotation_scale * np.pi / 180.0 # Convert to radians
+
         # Apply safety limits for rotation
         delta_rotation = np.clip(raw_rotation, -self.max_rotation_delta, self.max_rotation_delta)
 
+
         # 3. Handle Gripper State using config values
         gripper_width = config.GRIPPER_CLOSED_WIDTH  # Default closed
-        if mouse_state.buttons[1]:  # Right button = open (like reference)
+        if controller_state.buttons[1]:  # Right button = open (like reference)
             gripper_width = config.GRIPPER_OPEN_WIDTH
-        elif mouse_state.buttons[0]:  # Left button = close (like reference)
+        elif controller_state.buttons[0]:  # Left button = close (like reference)
             gripper_width = config.GRIPPER_CLOSED_WIDTH
 
         # For real-time control, we provide deltas instead of absolute pose
@@ -64,7 +66,7 @@ class TeleopPolicy:
         target_pose = current_ee_pose.copy()
         target_pose[:3, 3] += delta_translation
 
-        if mouse_state.buttons[1]:
+        if controller_state.buttons[1]:
             delta_rotation_matrix = R.from_euler('xyz', delta_rotation)
             current_rotation = R.from_matrix(target_pose[:3, :3])
             new_rotation = delta_rotation_matrix * current_rotation
@@ -76,12 +78,12 @@ class TeleopPolicy:
             'delta_translation': delta_translation,  # For real-time control
             'delta_rotation': delta_rotation,  # For real-time control
             'velocity_cmd': {  # For franky velocity control (not used anymore)
-                "x": float(delta_translation[0] * 10),  # Scale up for velocity
-                "y": float(delta_translation[1] * 10),
-                "z": float(delta_translation[2] * 10),
-                "R": float(delta_rotation[0] * 2),
-                "P": float(delta_rotation[1] * 2),
-                "Y": float(delta_rotation[2] * 2),
+                "x": float(delta_translation[0]),
+                "y": float(delta_translation[1]),
+                "z": float(delta_translation[2]),
+                "R": float(delta_rotation[0]),
+                "P": float(delta_rotation[1]),
+                "Y": float(delta_rotation[2]),
                 "is_async": True,  # No duration - continuous velocity control
             }
         }
